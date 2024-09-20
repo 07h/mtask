@@ -162,20 +162,9 @@ proj/
 
 .bash_history
 
-/static/
-
 *$*
 
 __t*.py
 _t*.py
 
-Backend/data/*
-Backend/logs/*
-
-Backend/configs/prometheus/storage/*
-
-# Игнорируем файлы конфигурации nginx для предзагрузки
-# потому что они генерируются при сборке контейнера
-app_preload.conf
-landing_preload.conf
-cloudflare.conf
+.vscode

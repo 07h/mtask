@@ -2,14 +2,14 @@
 authors = ["Your Name <your.email@example.com>"]
 description = "A simple task queue and scheduler library using Redis and asyncio with greenlet-based workers."
 license = "MIT"
-name = "mTask"
+name = "μTask"
 version = "0.1.0"
 
 [tool.poetry.dependencies]
-aioredis = "^2.0.0"
-croniter = "^1.0.15"
-greenlet = "^1.1.2"
+croniter = "^3.0.3"
+pydantic = "^2.4.2"
 python = ">=3.8"
+redis = "^4.5.0"
 
 [tool.poetry.dev-dependencies]
 black = "^21"
