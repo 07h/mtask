@@ -1,5 +1,3 @@
-# mTask.py
-
 import asyncio
 import inspect
 import json
@@ -73,7 +71,7 @@ class TaskQueue:
 
     def __init__(
         self,
-        redis_url: str = "redis://localhost:6379",
+        redis_url: str = "redis://localhost:6379/0",
         logger: Optional[logging.Logger] = None,
     ):
         """
