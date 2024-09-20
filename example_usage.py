@@ -21,7 +21,7 @@ class ExampleTaskData(BaseModel):
 
 # Initialize the mTask instance
 mtask = mTask(
-    redis_url="redis://localhost:6379",
+    redis_url="redis://localhost:6379/0",
     enable_logging=False,
     retry_limit=3,
 )
