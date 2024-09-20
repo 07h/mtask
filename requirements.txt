@@ -1,0 +1,6 @@
+# requirements.txt
+
+aioredis>=2.0.0
+croniter>=1.0.15
+greenlet>=1.1.2
+pytest>=7.0.0

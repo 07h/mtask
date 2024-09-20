@@ -1,0 +1,22 @@
+[tool.poetry]
+authors = ["Your Name <your.email@example.com>"]
+description = "A simple task queue and scheduler library using Redis and asyncio with greenlet-based workers."
+license = "MIT"
+name = "mTask"
+version = "0.1.0"
+
+[tool.poetry.dependencies]
+aioredis = "^2.0.0"
+croniter = "^1.0.15"
+greenlet = "^1.1.2"
+python = ">=3.8"
+
+[tool.poetry.dev-dependencies]
+black = "^21"
+pytest = "^7.4.2"
+pytest-asyncio = "^0.21.1"
+pytest-env = "^1.1.1"
+
+[build-system]
+build-backend = "poetry.core.masonry.api"
+requires = ["poetry-core>=1.0.0"]
