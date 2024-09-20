@@ -7,7 +7,9 @@ from pydantic import BaseModel
 from mTask import mTask
 
 # Configure logging for the example script
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(
+    level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s"
+)
 logger = logging.getLogger("ExampleUsage")
 
 
@@ -20,6 +22,7 @@ class ExampleTaskData(BaseModel):
 # Initialize the mTask instance
 mtask = mTask(
     redis_url="redis://localhost:6379",
+    enable_logging=False,
     retry_limit=3,
 )
 
