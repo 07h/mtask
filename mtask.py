@@ -246,7 +246,7 @@ class TaskQueue:
 
     async def recover_processing_tasks(self, queue_name: str):
         """
-        Recover tasks from the processing queue back to the main queue.
+        Recover tasks from the processing queue back to the main queue at startup.
 
         Args:
             queue_name (str): Name of the Redis queue.
@@ -254,20 +254,16 @@ class TaskQueue:
         processing_queue = f"{queue_name}:processing"
         main_queue = queue_name
         try:
-            while True:
-                # BRPOPLPUSH with timeout=0 to pop all tasks
-                task_json = await self.redis.brpoplpush(
-                    processing_queue, main_queue, timeout=0
-                )
-                if not task_json:
-                    break
+            # Get all tasks from processing queue
+            tasks = await self.redis.lrange(processing_queue, 0, -1)
+            for task_json in tasks:
+                # Requeue each task back to main queue
+                await self.redis.rpush(main_queue, task_json)
+                await self.redis.lrem(processing_queue, 0, task_json)
                 task = json.loads(task_json)
                 self.logger.info(
                     f"Recovered task {task['id']} from processing queue '{processing_queue}' back to main queue '{main_queue}'."
                 )
-        except asyncio.CancelledError:
-            # Handle task cancellation gracefully
-            pass
         except Exception as e:
             self.logger.exception(
                 f"Failed to recover tasks from processing queue '{processing_queue}': {e}"
@@ -964,7 +960,7 @@ class mTask:
             tasks = await self.task_queue.redis.lrange(processing_queue, 0, -1)
             for task_json in tasks:
                 task = json.loads(task_json)
-                # Optionally, implement logic to check if the task has expired
+                # Optional: Implement logic to check if the task has expired
                 # For simplicity, we assume all tasks in processing queue need to be requeued
                 await self.task_queue.requeue(task, queue_name=main_queue)
                 await self.task_queue.redis.lrem(processing_queue, 0, task_json)

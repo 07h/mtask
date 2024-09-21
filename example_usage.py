@@ -19,7 +19,7 @@ class ExampleTaskData(BaseModel):
 
 # Initialize the mTask instance
 mtask = mTask(
-    redis_url="redis://localhost:6379/0",
+    redis_url="redis://localhost:6379/9",
     # enable_logging=False,
     retry_limit=3,
 )
@@ -37,8 +37,8 @@ async def example_task(data: ExampleTaskData):
     logger.info(
         f"🔥 Executing example_task with param1={data.param1}, param2='{data.param2}'"
     )
-    await asyncio.sleep(10)  # Simulate a task taking some time
-    logger.info("example_task completed.")
+    await asyncio.sleep(70)  # Simulate a task taking some time
+    logger.info("🔥🔥 example_task completed.")
 
 
 # Define an interval-based scheduled task using the @interval decorator
