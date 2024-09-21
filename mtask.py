@@ -670,7 +670,7 @@ class mTask:
         table = f"{header_row}\n{separator}\n{data_rows}"
         return table
 
-    def task(
+    def agent(
         self,
         queue_name: str = "default",
         concurrency: int = 1,
