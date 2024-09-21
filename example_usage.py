@@ -26,7 +26,7 @@ mtask = mTask(
 
 
 # Define a regular task using the @task decorator
-@mtask.task(queue_name="default", concurrency=3)
+@mtask.agent(queue_name="default", concurrency=3)
 async def example_task(data: ExampleTaskData):
     """
     Example task that simulates work by sleeping.
