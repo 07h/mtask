@@ -20,7 +20,7 @@ class ExampleTaskData(BaseModel):
 # Initialize the mTask instance
 mtask = mTask(
     redis_url="redis://localhost:6379/0",
-    enable_logging=False,
+    # enable_logging=False,
     retry_limit=3,
 )
 
@@ -78,9 +78,8 @@ async def scheduled_cron_task():
     """
     Example cron-based scheduled task.
     """
-    logger.info("💎 Executing scheduled_cron_task.")
-    await asyncio.sleep(1)  # Simulate task duration
-    logger.info("scheduled_cron_task completed.")
+    # Example of pausing the 'default' queue for 30 seconds
+    await mtask.pause_queue(queue_name="default", duration=30)
 
 
 # Main coroutine to run the mTask manager
