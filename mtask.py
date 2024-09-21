@@ -67,7 +67,7 @@ class TaskFunctionNotFoundError(mTaskError):
 
 class TaskQueue:
     """
-    Manages task queues using Redis.
+    Manages task queues using Redis with support for processing queues.
     """
 
     def __init__(
@@ -117,7 +117,7 @@ class TaskQueue:
         kwargs: Dict[str, Any] = None,
     ) -> str:
         """
-        Add a task to the specified Redis queue.
+        Add a task to the specified Redis main queue.
 
         Args:
             queue_name (str): Name of the Redis queue.
@@ -152,7 +152,7 @@ class TaskQueue:
 
     async def dequeue(self, queue_name: str = "default") -> Optional[Dict[str, Any]]:
         """
-        Retrieve a task from the specified Redis queue.
+        Atomically move a task from the main queue to the processing queue and retrieve it.
 
         Args:
             queue_name (str, optional): Name of the Redis queue.
@@ -168,12 +168,16 @@ class TaskQueue:
             self.logger.error("Redis is not connected.")
             raise RedisConnectionError("Redis is not connected.")
 
+        processing_queue = f"{queue_name}:processing"
         try:
-            task_json = await self.redis.lpop(queue_name)
+            # BRPOPLPUSH: Atomically pop from main queue and push to processing queue
+            task_json = await self.redis.brpoplpush(
+                queue_name, processing_queue, timeout=5
+            )
             if task_json:
                 task = json.loads(task_json)
                 self.logger.debug(
-                    f"Dequeued task {task['id']} with name '{task['name']}' from queue '{queue_name}'"
+                    f"Dequeued task {task['id']} with name '{task['name']}' from queue '{queue_name}' to processing queue '{processing_queue}'"
                 )
                 return task
             return None
@@ -187,7 +191,7 @@ class TaskQueue:
 
     async def requeue(self, task: Dict[str, Any], queue_name: str = "default") -> None:
         """
-        Re-add a task to the specified Redis queue for retrying.
+        Re-add a task to the specified Redis main queue for retrying.
 
         Args:
             task (Dict[str, Any]): The task data.
@@ -211,15 +215,63 @@ class TaskQueue:
             self.logger.exception(f"Failed to requeue task '{task['id']}': {e}")
             raise TaskRequeueError(f"Failed to requeue task '{task['id']}': {e}") from e
 
-    async def mark_completed(self, task_id: str) -> None:
+    async def mark_completed(self, task_id: str, queue_name: str) -> None:
         """
-        Mark a task as completed.
+        Remove a task from the processing queue after successful execution.
 
         Args:
             task_id (str): Unique identifier of the task.
+            queue_name (str): Name of the Redis queue.
+
+        Raises:
+            TaskProcessingError: If marking the task as completed fails.
         """
-        self.logger.info(f"Task {task_id} marked as completed.")
-        # Implement storage of completed tasks if necessary
+        processing_queue = f"{queue_name}:processing"
+        try:
+            # Retrieve all tasks in the processing queue
+            tasks = await self.redis.lrange(processing_queue, 0, -1)
+            for task_json in tasks:
+                task = json.loads(task_json)
+                if task["id"] == task_id:
+                    await self.redis.lrem(processing_queue, 0, task_json)
+                    self.logger.info(
+                        f"Task {task_id} marked as completed and removed from processing queue '{processing_queue}'."
+                    )
+                    break
+        except Exception as e:
+            self.logger.exception(f"Failed to mark task {task_id} as completed: {e}")
+            raise TaskProcessingError(
+                f"Failed to mark task {task_id} as completed: {e}"
+            ) from e
+
+    async def recover_processing_tasks(self, queue_name: str):
+        """
+        Recover tasks from the processing queue back to the main queue.
+
+        Args:
+            queue_name (str): Name of the Redis queue.
+        """
+        processing_queue = f"{queue_name}:processing"
+        main_queue = queue_name
+        try:
+            while True:
+                # BRPOPLPUSH with timeout=0 to pop all tasks
+                task_json = await self.redis.brpoplpush(
+                    processing_queue, main_queue, timeout=0
+                )
+                if not task_json:
+                    break
+                task = json.loads(task_json)
+                self.logger.info(
+                    f"Recovered task {task['id']} from processing queue '{processing_queue}' back to main queue '{main_queue}'."
+                )
+        except asyncio.CancelledError:
+            # Handle task cancellation gracefully
+            pass
+        except Exception as e:
+            self.logger.exception(
+                f"Failed to recover tasks from processing queue '{processing_queue}': {e}"
+            )
 
 
 # ============================
@@ -377,7 +429,8 @@ class Worker:
                     )
                     await func(**kwargs)
 
-                await self.task_queue.mark_completed(task["id"])
+                # Mark task as completed
+                await self.task_queue.mark_completed(task["id"], queue_name)
                 self.logger.info(
                     f"Worker {worker_id}: Task {task['id']} completed successfully."
                 )
@@ -492,8 +545,6 @@ class mTask:
     Main class to manage tasks, scheduling, and workers.
     """
 
-    INTERVAL_STATUS_REPORT = 60 * 1  # minutes
-
     def __init__(
         self,
         redis_url: str = "redis://localhost:6379",
@@ -542,7 +593,7 @@ class mTask:
         Initialize an internal scheduled task that reports the status of all queues every 5 minutes.
         """
 
-        @self.interval(seconds=mTask.INTERVAL_STATUS_REPORT)
+        @self.interval(seconds=300)  # 5 minutes
         async def status_report_task():
             """
             Internal task to report the status of all queues.
@@ -555,7 +606,7 @@ class mTask:
             for queue_name, task_info in self.task_registry.items():
                 concurrency = task_info.get("concurrency", 1)
                 status = self.queue_status.get(queue_name, "Running")
-                # Get the number of tasks in the queue
+                # Get the number of tasks in the main queue
                 try:
                     queue_length = await self.task_queue.redis.llen(queue_name)
                 except Exception as e:
@@ -619,13 +670,13 @@ class mTask:
         table = f"{header_row}\n{separator}\n{data_rows}"
         return table
 
-    def agent(
+    def task(
         self,
         queue_name: str = "default",
         concurrency: int = 1,
     ):
         """
-        Decorator to register a task function with the mTask manager.
+        Decorator to define and register a task.
 
         Args:
             queue_name (str, optional): Redis queue name to enqueue the task.
@@ -780,14 +831,14 @@ class mTask:
     async def add_task(
         self,
         queue_name: str,
-        data_model: BaseModel,
+        data_model: Any,
     ) -> str:
         """
-        Manually add a task to the queue with Pydantic model data.
+        Manually add a task to the main queue with Pydantic model data or a dictionary.
 
         Args:
             queue_name (str): Name of the Redis queue.
-            data_model (BaseModel): Pydantic model containing task parameters.
+            data_model (Any): Pydantic model or dictionary containing task parameters.
 
         Returns:
             str: Unique identifier of the enqueued task.
@@ -795,10 +846,18 @@ class mTask:
         Raises:
             TaskEnqueueError: If enqueueing the task fails.
         """
+        if isinstance(data_model, BaseModel):
+            data = data_model.model_dump()
+        elif isinstance(data_model, dict):
+            data = data_model
+        else:
+            self.logger.error("data_model must be a Pydantic model or a dictionary.")
+            raise ValueError("data_model must be a Pydantic model or a dictionary.")
+
         try:
             task_id = await self.task_queue.enqueue(
                 queue_name=queue_name,
-                kwargs=data_model.model_dump(),
+                kwargs=data,
             )
             self.logger.info(
                 f"Manual task enqueued in queue '{queue_name}' with ID {task_id}"
@@ -850,7 +909,7 @@ class mTask:
 
     async def connect_and_start_workers(self):
         """
-        Connect to Redis and start all workers.
+        Connect to Redis and start all workers, recovering any tasks from processing queues.
         """
         try:
             # Pass the mTask's logger to TaskQueue
@@ -861,6 +920,10 @@ class mTask:
         except RedisConnectionError as e:
             self.logger.error(f"Cannot start workers without Redis connection: {e}")
             raise
+
+        # Recover tasks from processing queues
+        for queue_name in self.task_registry.keys():
+            await self.task_queue.recover_processing_tasks(queue_name)
 
         # Create and start a worker for each queue based on concurrency
         for queue_name, task_info in self.task_registry.items():
@@ -874,6 +937,44 @@ class mTask:
 
         # Start the scheduled tasks runner
         asyncio.create_task(self.run_scheduled_tasks())
+
+        # Start the expired tasks recovery
+        asyncio.create_task(self.run_expired_tasks_recovery())
+
+    async def run_expired_tasks_recovery(self):
+        """
+        Periodically recover expired tasks from processing queues back to main queues.
+        """
+        while True:
+            for queue_name in self.task_registry.keys():
+                await self.recover_expired_tasks(queue_name)
+            await asyncio.sleep(30)  # Check every 30 seconds
+
+    async def recover_expired_tasks(self, queue_name: str):
+        """
+        Recover tasks from the processing queue back to the main queue if they have expired.
+
+        Args:
+            queue_name (str): Name of the Redis queue.
+        """
+        processing_queue = f"{queue_name}:processing"
+        main_queue = queue_name
+        try:
+            # Retrieve all tasks in the processing queue
+            tasks = await self.task_queue.redis.lrange(processing_queue, 0, -1)
+            for task_json in tasks:
+                task = json.loads(task_json)
+                # Optionally, implement logic to check if the task has expired
+                # For simplicity, we assume all tasks in processing queue need to be requeued
+                await self.task_queue.requeue(task, queue_name=main_queue)
+                await self.task_queue.redis.lrem(processing_queue, 0, task_json)
+                self.logger.info(
+                    f"Recovered expired task {task['id']} from processing queue '{processing_queue}' back to main queue '{main_queue}'."
+                )
+        except Exception as e:
+            self.logger.exception(
+                f"Failed to recover expired tasks from processing queue '{processing_queue}': {e}"
+            )
 
     async def run(self):
         """
@@ -922,20 +1023,27 @@ class mTask:
             self.logger.error(f"Queue '{queue_name}' not found.")
             raise mTaskError(f"Queue '{queue_name}' not found.")
 
-        current_status = self.queue_status.get(queue_name, "Running")
-        if current_status == "Paused":
-            self.logger.warning(f"Queue '{queue_name}' is already paused.")
-            return
+        status_key = f"queue_status:{queue_name}"
+        try:
+            current_status = await self.task_queue.redis.get(status_key) or "Running"
+            if current_status == "Paused":
+                self.logger.warning(f"Queue '{queue_name}' is already paused.")
+                return
 
-        # Stop the worker
-        await self.workers[queue_name].stop()
+            # Set status to Paused in Redis
+            await self.task_queue.redis.set(status_key, "Paused")
 
-        # Update the status
-        self.queue_status[queue_name] = "Paused"
-        self.logger.info(f"Queue '{queue_name}' paused for {duration} seconds.")
+            # Stop the worker
+            await self.workers[queue_name].stop()
 
-        # Schedule resume after duration
-        asyncio.create_task(self._schedule_resume(queue_name, duration))
+            self.queue_status[queue_name] = "Paused"
+            self.logger.info(f"Queue '{queue_name}' paused for {duration} seconds.")
+
+            # Schedule resume after duration
+            asyncio.create_task(self._schedule_resume(queue_name, duration))
+        except Exception as e:
+            self.logger.exception(f"Failed to pause queue '{queue_name}': {e}")
+            raise mTaskError(f"Failed to pause queue '{queue_name}': {e}") from e
 
     async def _schedule_resume(self, queue_name: str, duration: int):
         """
@@ -958,14 +1066,21 @@ class mTask:
         Raises:
             mTaskError: If the queue is not paused.
         """
-        current_status = self.queue_status.get(queue_name, "Running")
-        if current_status != "Paused":
-            self.logger.warning(f"Queue '{queue_name}' is not paused.")
-            return
+        status_key = f"queue_status:{queue_name}"
+        try:
+            current_status = await self.task_queue.redis.get(status_key) or "Running"
+            if current_status != "Paused":
+                self.logger.warning(f"Queue '{queue_name}' is not paused.")
+                return
 
-        # Update the status
-        self.queue_status[queue_name] = "Running"
-        self.logger.info(f"Queue '{queue_name}' resumed.")
+            # Set status to Running in Redis
+            await self.task_queue.redis.set(status_key, "Running")
 
-        # Restart the worker
-        self.start_worker(queue_name)
+            self.queue_status[queue_name] = "Running"
+            self.logger.info(f"Queue '{queue_name}' resumed.")
+
+            # Restart the worker
+            self.start_worker(queue_name)
+        except Exception as e:
+            self.logger.exception(f"Failed to resume queue '{queue_name}': {e}")
+            raise mTaskError(f"Failed to resume queue '{queue_name}': {e}") from e
