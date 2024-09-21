@@ -1,8 +1,8 @@
 [tool.poetry]
 authors = ["Your Name <your.email@example.com>"]
-description = "A simple task queue and scheduler library using Redis and asyncio"
+description = "μTask is a simple task queue and scheduler library using Redis and asyncio"
 license = "MIT"
-name = "μTask"
+name = "mtask"
 version = "0.1.0"
 
 [tool.poetry.dependencies]
