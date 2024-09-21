@@ -934,43 +934,6 @@ class mTask:
         # Start the scheduled tasks runner
         asyncio.create_task(self.run_scheduled_tasks())
 
-        # Start the expired tasks recovery
-        asyncio.create_task(self.run_expired_tasks_recovery())
-
-    async def run_expired_tasks_recovery(self):
-        """
-        Periodically recover expired tasks from processing queues back to main queues.
-        """
-        while True:
-            for queue_name in self.task_registry.keys():
-                await self.recover_expired_tasks(queue_name)
-            await asyncio.sleep(30)  # Check every 30 seconds
-
-    async def recover_expired_tasks(self, queue_name: str):
-        """
-        Recover tasks from the processing queue back to the main queue if they have expired.
-
-        Args:
-            queue_name (str): Name of the Redis queue.
-        """
-        processing_queue = f"{queue_name}:processing"
-        main_queue = queue_name
-        try:
-            # Retrieve all tasks in the processing queue
-            tasks = await self.task_queue.redis.lrange(processing_queue, 0, -1)
-            for task_json in tasks:
-                task = json.loads(task_json)
-                # Optional: Implement logic to check if the task has expired
-                # For simplicity, we assume all tasks in processing queue need to be requeued
-                await self.task_queue.requeue(task, queue_name=main_queue)
-                await self.task_queue.redis.lrem(processing_queue, 0, task_json)
-                self.logger.info(
-                    f"Recovered expired task {task['id']} from processing queue '{processing_queue}' back to main queue '{main_queue}'."
-                )
-        except Exception as e:
-            self.logger.exception(
-                f"Failed to recover expired tasks from processing queue '{processing_queue}': {e}"
-            )
 
     async def run(self):
         """
