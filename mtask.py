@@ -672,7 +672,7 @@ class mTask:
 
                 if model:
                     try:
-                        data = model(**kwargs).dict()
+                        data = model(**kwargs).model_dump()
                     except Exception as e:
                         self.logger.error(f"Error parsing data with model {model}: {e}")
                         raise
@@ -798,7 +798,7 @@ class mTask:
         try:
             task_id = await self.task_queue.enqueue(
                 queue_name=queue_name,
-                kwargs=data_model.dict(),
+                kwargs=data_model.model_dump(),
             )
             self.logger.info(
                 f"Manual task enqueued in queue '{queue_name}' with ID {task_id}"
