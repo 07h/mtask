@@ -934,7 +934,6 @@ class mTask:
         # Start the scheduled tasks runner
         asyncio.create_task(self.run_scheduled_tasks())
 
-
     async def run(self):
         """
         Start the TaskQueue, Workers, Scheduled Tasks, and keep the event loop running.
@@ -944,6 +943,8 @@ class mTask:
         except mTaskError as e:
             self.logger.error(f"Failed to start mTask: {e}")
             return
+
+        asyncio.create_task(self.monitor_queue_status())
 
         self.logger.info("mTask is running. Press Ctrl+C to exit.")
 
@@ -1001,42 +1002,30 @@ class mTask:
             self.logger.exception(f"Failed to pause queue '{queue_name}': {e}")
             raise mTaskError(f"Failed to pause queue '{queue_name}': {e}") from e
 
-    async def _schedule_resume(self, queue_name: str, duration: int):
+    async def monitor_queue_status(self):
         """
-        Schedule the resumption of a paused queue after a certain duration.
-
-        Args:
-            queue_name (str): Name of the Redis queue to resume.
-            duration (int): Duration in seconds to wait before resuming.
+        Периодически проверяет статус очередей и перезапускает воркеры при необходимости.
         """
-        await asyncio.sleep(duration)
-        await self.resume_queue(queue_name)
+        while True:
+            for queue_name in self.task_registry.keys():
+                status_key = f"queue_status:{queue_name}"
+                current_status = await self.task_queue.redis.get(status_key)
+                previous_status = self.queue_status.get(queue_name, "Running")
 
-    async def resume_queue(self, queue_name: str):
-        """
-        Resume a paused queue by restarting its workers.
-
-        Args:
-            queue_name (str): Name of the Redis queue to resume.
-
-        Raises:
-            mTaskError: If the queue is not paused.
-        """
-        status_key = f"queue_status:{queue_name}"
-        try:
-            current_status = await self.task_queue.redis.get(status_key) or "Running"
-            if current_status != "Paused":
-                self.logger.warning(f"Queue '{queue_name}' is not paused.")
-                return
-
-            # Set status to Running in Redis
-            await self.task_queue.redis.set(status_key, "Running")
-
-            self.queue_status[queue_name] = "Running"
-            self.logger.info(f"Queue '{queue_name}' resumed.")
-
-            # Restart the worker
-            self.start_worker(queue_name)
-        except Exception as e:
-            self.logger.exception(f"Failed to resume queue '{queue_name}': {e}")
-            raise mTaskError(f"Failed to resume queue '{queue_name}': {e}") from e
+                if current_status != previous_status:
+                    if current_status == "Paused":
+                        # Очередь была поставлена на паузу
+                        self.queue_status[queue_name] = "Paused"
+                        self.logger.info(f"Queue '{queue_name}' is paused.")
+                        # Остановить воркеры
+                        if queue_name in self.workers:
+                            await self.workers[queue_name].stop()
+                    elif current_status is None or current_status == "Running":
+                        # Статус ключа отсутствует или очередь снова активна
+                        if previous_status == "Paused":
+                            # Очередь была в состоянии паузы, нужно возобновить
+                            self.queue_status[queue_name] = "Running"
+                            self.logger.info(f"Queue '{queue_name}' is resumed.")
+                            self.start_worker(queue_name)
+                # Можно добавить обработку других состояний при необходимости
+            await asyncio.sleep(5)  # Проверяем статус каждые 5 секунд
