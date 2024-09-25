@@ -989,17 +989,14 @@ class mTask:
                 self.logger.warning(f"Queue '{queue_name}' is already paused.")
                 return
 
-            # Set status to Paused in Redis
-            await self.task_queue.redis.set(status_key, "Paused")
+            # Set status to Paused in Redis with TTL
+            await self.task_queue.redis.set(status_key, "Paused", ex=duration)
 
             # Stop the worker
             await self.workers[queue_name].stop()
 
             self.queue_status[queue_name] = "Paused"
             self.logger.info(f"Queue '{queue_name}' paused for {duration} seconds.")
-
-            # Schedule resume after duration
-            asyncio.create_task(self._schedule_resume(queue_name, duration))
         except Exception as e:
             self.logger.exception(f"Failed to pause queue '{queue_name}': {e}")
             raise mTaskError(f"Failed to pause queue '{queue_name}': {e}") from e
