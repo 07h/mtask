@@ -1,109 +1,75 @@
+# example_usage.py
+
 import asyncio
-from datetime import datetime
 import logging
 from pydantic import BaseModel
+
+# Import the mTask class from the mTask library
 from mtask import mTask
 
-# Configure logging for the example script
-logging.basicConfig(
-    level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s"
+# Create an instance of mTask
+mtask = mTask(
+    redis_url="redis://localhost:6379/9",
+    retry_limit=3,
+    log_level=logging.INFO,
+    enable_logging=True,
 )
-logger = logging.getLogger("ExampleUsage")
 
 
 # Define a Pydantic model for task data
-class ExampleTaskData(BaseModel):
-    param1: int
-    param2: str
+class TaskData(BaseModel):
+    value: int
+    string: str = "default"
 
 
-# Initialize the mTask instance
-mtask = mTask(
-    redis_url="redis://localhost:6379/9",
-    # enable_logging=False,
-    retry_limit=3,
-)
+# Define a task using the @agent decorator with concurrency
+@mtask.agent(queue_name="default", concurrency=2)
+async def process_data(data: TaskData):
+    """Process the data"""
+    print(f"Processing data: {data.value}")
+    await asyncio.sleep(1)  # Simulate some processing time
+
+    # Enqueue a new task from within a task
+    if data.value < 5:
+        new_data = TaskData(value=data.value + 1)
+        await mtask.add_task(queue_name="default", data_model=new_data)
+        print(f"Enqueued new task with value: {new_data.value}")
 
 
-# Define a regular task using the @task decorator
-@mtask.agent(queue_name="default", concurrency=3)
-async def example_task(data: ExampleTaskData):
-    """
-    Example task that simulates work by sleeping.
-
-    Args:
-        data (ExampleTaskData): Data model containing task parameters.
-    """
-    logger.info(
-        f"🔥 Executing example_task with param1={data.param1}, param2='{data.param2}'"
-    )
-    await asyncio.sleep(70)  # Simulate a task taking some time
-    logger.info("🔥🔥 example_task completed.")
+# Define a scheduled task using the @interval decorator
+@mtask.interval(seconds=10)
+async def scheduled_task():
+    """Scheduled task that runs every 10 seconds"""
+    print("Scheduled task is running...")
+    # Enqueue a task
+    data = TaskData(value=0)
+    await mtask.add_task(queue_name="default", data_model=data)
 
 
-# Define an interval-based scheduled task using the @interval decorator
-@mtask.interval(
-    seconds=10,  # Set to 10 seconds
-)
-async def scheduled_interval_task():
-    """
-    Example interval-based scheduled task.
-    """
-    logger.info("🌀 Executing scheduled_interval_task.")
-    await asyncio.sleep(1)  # Simulate task duration
-    logger.info("scheduled_interval_task completed.")
-
-
-@mtask.interval(
-    seconds=20,  # Set to 10 seconds
-)
-async def scheduled_interval_task2():
-    """
-    Example interval-based scheduled task.
-    """
-    data = ExampleTaskData(
-        param1=10, param2=f"⭐️ ADD TASK FROM SCHEDULED TASK: {datetime.now()}"
-    )
-    await mtask.add_task(
-        queue_name="default",
-        data_model=data,
-    )
-
-
-# Define a cron-based scheduled task using the @cron decorator
-@mtask.cron(
-    cron_expression="*/1 * * * *",  # Every 1 minute
-)
+# Define another scheduled task using the @cron decorator
+@mtask.cron(cron_expression="*/1 * * * *")  # Every minute
 async def scheduled_cron_task():
-    """
-    Example cron-based scheduled task.
-    """
-    # Example of pausing the 'default' queue for 30 seconds
+    """Scheduled task that runs every minute"""
+    print("Scheduled cron task is running...")
+    # Pause the queue for 30 seconds
     await mtask.pause_queue(queue_name="default", duration=30)
+    print("Paused the 'default' queue for 30 seconds.")
 
 
-# Main coroutine to run the mTask manager
 async def main():
-    """
-    Main function to start the mTask manager.
-    """
-
-    # Start the mTask manager (connect, start workers, run scheduled tasks)
+    # Start the mTask manager
     manager_task = asyncio.create_task(mtask.run())
 
-    # Wait a short moment to ensure the connection is established
-    await asyncio.sleep(1)
-
-    # Enqueue a manual task using add_task with Pydantic model
-    data = ExampleTaskData(param1=10, param2="test")
-    await mtask.add_task(
-        queue_name="default",
-        data_model=data,
-    )
-    logger.info("Enqueued a manual example_task.")
-
-    # Keep the main coroutine running to allow scheduled tasks to execute
-    await manager_task
+    # Keep the program running indefinitely
+    try:
+        await asyncio.Event().wait()
+    except KeyboardInterrupt:
+        # Handle graceful shutdown on Ctrl+C
+        print("Shutting down...")
+    finally:
+        # Stop the manager
+        manager_task.cancel()
+        await asyncio.gather(manager_task, return_exceptions=True)
 
 
 if __name__ == "__main__":

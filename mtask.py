@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, Optional, List
 from croniter import croniter
 import redis.asyncio as redis
 from pydantic import BaseModel
+import threading
 
 # ============================
 # Custom Exception Classes
@@ -170,11 +171,13 @@ class TaskQueue:
 
         processing_queue = f"{queue_name}:processing"
         try:
-            # BRPOPLPUSH: Atomically pop from main queue and push to processing queue
-            task_json = await self.redis.brpoplpush(
-                queue_name, processing_queue, timeout=5
-            )
-            if task_json:
+            # BLPOP: Blocking pop from the left end (FIFO)
+            task_tuple = await self.redis.blpop(queue_name, timeout=5)
+            if task_tuple:
+                _, task_json = task_tuple
+                # Do not modify the task
+                # Add task to processing queue
+                await self.redis.rpush(processing_queue, task_json)
                 task = json.loads(task_json)
                 self.logger.debug(
                     f"Dequeued task {task['id']} with name '{task['name']}' from queue '{queue_name}' to processing queue '{processing_queue}'"
@@ -188,6 +191,28 @@ class TaskQueue:
             raise TaskDequeueError(
                 f"Failed to dequeue task from queue '{queue_name}': {e}"
             ) from e
+
+    async def _update_task_in_processing_queue(
+        self, processing_queue: str, task: Dict[str, Any]
+    ):
+        """
+        Update the task in the processing queue with new data.
+
+        Args:
+            processing_queue (str): Name of the processing queue.
+            task (Dict[str, Any]): The task data to update.
+        """
+        try:
+            # Retrieve all tasks in the processing queue
+            tasks = await self.redis.lrange(processing_queue, 0, -1)
+            for index, task_json in enumerate(tasks):
+                existing_task = json.loads(task_json)
+                if existing_task["id"] == task["id"]:
+                    # Update the task at the specific index
+                    await self.redis.lset(processing_queue, index, json.dumps(task))
+                    break
+        except Exception as e:
+            self.logger.exception(f"Failed to update task in processing queue: {e}")
 
     async def requeue(self, task: Dict[str, Any], queue_name: str = "default") -> None:
         """
@@ -206,6 +231,8 @@ class TaskQueue:
             raise RedisConnectionError("Redis is not connected.")
 
         task["status"] = "pending"
+        # Remove start_time when requeuing
+        task.pop("start_time", None)
         try:
             await self.redis.rpush(queue_name, json.dumps(task))
             self.logger.debug(
@@ -233,6 +260,7 @@ class TaskQueue:
             for task_json in tasks:
                 task = json.loads(task_json)
                 if task["id"] == task_id:
+                    # Remove the task using the exact task_json
                     await self.redis.lrem(processing_queue, 0, task_json)
                     self.logger.info(
                         f"Task {task_id} marked as completed and removed from processing queue '{processing_queue}'."
@@ -256,18 +284,54 @@ class TaskQueue:
         try:
             # Get all tasks from processing queue
             tasks = await self.redis.lrange(processing_queue, 0, -1)
-            for task_json in tasks:
-                # Requeue each task back to main queue
-                await self.redis.rpush(main_queue, task_json)
-                await self.redis.lrem(processing_queue, 0, task_json)
-                task = json.loads(task_json)
+            if tasks:
+                # Move tasks back to main queue (to the front)
+                await self.redis.lpush(main_queue, *tasks[::-1])
+                await self.redis.delete(processing_queue)
                 self.logger.info(
-                    f"Recovered task {task['id']} from processing queue '{processing_queue}' back to main queue '{main_queue}'."
+                    f"Recovered {len(tasks)} tasks from processing queue '{processing_queue}' back to main queue '{main_queue}'."
                 )
         except Exception as e:
             self.logger.exception(
                 f"Failed to recover tasks from processing queue '{processing_queue}': {e}"
             )
+
+    async def get_task_count(self, queue_name: str) -> int:
+        """
+        Get the number of tasks in the main queue.
+
+        Args:
+            queue_name (str): Name of the Redis queue.
+
+        Returns:
+            int: Number of tasks in the queue.
+        """
+        try:
+            count = await self.redis.llen(queue_name)
+            return count
+        except Exception as e:
+            self.logger.error(f"Failed to get task count for '{queue_name}': {e}")
+            return 0
+
+    async def get_processing_task_count(self, queue_name: str) -> int:
+        """
+        Get the number of tasks in the processing queue.
+
+        Args:
+            queue_name (str): Name of the Redis queue.
+
+        Returns:
+            int: Number of tasks in the processing queue.
+        """
+        processing_queue = f"{queue_name}:processing"
+        try:
+            count = await self.redis.llen(processing_queue)
+            return count
+        except Exception as e:
+            self.logger.error(
+                f"Failed to get processing task count for '{queue_name}': {e}"
+            )
+            return 0
 
 
 # ============================
@@ -284,6 +348,7 @@ class Worker:
         self,
         task_queue: TaskQueue,
         task_registry: Dict[str, Dict[str, Any]],
+        async_task_registry_lock: asyncio.Lock,
         retry_limit: int = 3,
         queue_name: str = "default",
         semaphore: Optional[asyncio.Semaphore] = None,
@@ -295,6 +360,7 @@ class Worker:
         Args:
             task_queue (TaskQueue): Instance of TaskQueue.
             task_registry (Dict[str, Dict[str, Any]]): Registry of task functions and their concurrency.
+            async_task_registry_lock (asyncio.Lock): Async lock for accessing task_registry.
             retry_limit (int, optional): Max retry attempts for failed tasks.
             queue_name (str, optional): Name of the Redis queue to process.
             semaphore (asyncio.Semaphore, optional): Semaphore to limit concurrency.
@@ -304,9 +370,10 @@ class Worker:
         self.retry_limit = retry_limit
         self.queue_name = queue_name
         self.task_registry = task_registry
+        self.async_task_registry_lock = async_task_registry_lock
         self.semaphore = semaphore if semaphore else asyncio.Semaphore(1)
         self._running = False
-        self._workers: list[asyncio.Task] = []
+        self._workers: List[asyncio.Task] = []
         self.logger = logger or logging.getLogger(f"Worker-{queue_name}")
 
         self.logger.debug(
@@ -328,8 +395,54 @@ class Worker:
         )
 
         for i in range(concurrency):
-            worker_task = asyncio.create_task(self._worker_loop(worker_id=i + 1))
-            self._workers.append(worker_task)
+            monitor_task = asyncio.create_task(self._monitor_worker(i + 1))
+            self._workers.append(monitor_task)
+
+    async def _monitor_worker(self, worker_id: int):
+        """
+        Monitors a worker loop and restarts it if it ends unexpectedly.
+        """
+        while self._running:
+            worker_task = asyncio.create_task(self._worker_loop(worker_id))
+            try:
+                await worker_task
+            except asyncio.CancelledError:
+                self.logger.info(f"Worker {worker_id}: Received shutdown signal.")
+                break
+            except Exception as e:
+                self.logger.exception(f"Worker {worker_id}: Unexpected error: {e}")
+                # Optionally, wait before restarting to prevent rapid restarts
+                await asyncio.sleep(1)
+                self.logger.info(
+                    f"Worker {worker_id}: Restarting after unexpected termination."
+                )
+            finally:
+                # Remove the completed task from the list
+                if worker_task in self._workers:
+                    self._workers.remove(worker_task)
+
+    async def _worker_loop(self, worker_id: int):
+        """
+        Main loop for each worker coroutine.
+        """
+        while self._running:
+            try:
+                async with self.semaphore:
+                    task = await self.task_queue.dequeue(queue_name=self.queue_name)
+                    if task:
+                        self.logger.info(
+                            f"Worker {worker_id}: Dequeued task {task['id']} from queue '{self.queue_name}'"
+                        )
+                        await self.process_task(task, worker_id)
+                    else:
+                        await asyncio.sleep(1)  # Prevent busy waiting
+            except asyncio.CancelledError:
+                self.logger.info(f"Worker {worker_id}: Received shutdown signal.")
+                break
+            except Exception as e:
+                self.logger.exception(f"Worker {worker_id}: Error in worker loop: {e}")
+                # Optionally, handle specific exceptions or implement retry logic
+                await asyncio.sleep(1)  # Wait before retrying
 
     async def stop(self):
         """
@@ -341,6 +454,7 @@ class Worker:
 
         self._running = False
         self.logger.info("Stopping workers...")
+
         for worker_task in self._workers:
             worker_task.cancel()
 
@@ -357,14 +471,15 @@ class Worker:
         """
         while self._running:
             try:
-                task = await self.task_queue.dequeue(queue_name=self.queue_name)
-                if task:
-                    self.logger.info(
-                        f"Worker {worker_id}: Dequeued task {task['id']} from queue '{self.queue_name}'"
-                    )
-                    await self.process_task(task, worker_id)
-                else:
-                    await asyncio.sleep(1)  # Prevent busy waiting
+                async with self.semaphore:
+                    task = await self.task_queue.dequeue(queue_name=self.queue_name)
+                    if task:
+                        self.logger.info(
+                            f"Worker {worker_id}: Dequeued task {task['id']} from queue '{self.queue_name}'"
+                        )
+                        await self.process_task(task, worker_id)
+                    else:
+                        await asyncio.sleep(1)  # Prevent busy waiting
             except asyncio.CancelledError:
                 self.logger.info(f"Worker {worker_id}: Received shutdown signal.")
                 break
@@ -385,7 +500,10 @@ class Worker:
         """
         queue_name = task["name"]  # 'name' corresponds to 'queue_name'
         kwargs = task.get("kwargs", {})
-        func = self.task_registry.get(queue_name, {}).get("func")  # Get the function
+        async with self.async_task_registry_lock:
+            func = self.task_registry.get(queue_name, {}).get(
+                "func"
+            )  # Get the function
         if not func:
             self.logger.error(f"Task function for queue '{queue_name}' not found.")
             raise TaskFunctionNotFoundError(
@@ -393,6 +511,7 @@ class Worker:
             )
 
         try:
+            task["start_time"] = datetime.utcnow().timestamp()
             self.logger.info(
                 f"Worker {worker_id}: Executing task {task['id']} from queue '{queue_name}'"
             )
@@ -411,25 +530,24 @@ class Worker:
                     model_class = param.annotation
                     break
 
-            async with self.semaphore:  # Use semaphore to limit concurrency
-                if expects_model and model_class:
-                    # Deserialize kwargs into Pydantic model
-                    data_model = model_class(**kwargs)
-                    self.logger.info(
-                        f"Worker {worker_id}: Executing task {task['id']} - '{queue_name}' with data={data_model}"
-                    )
-                    await func(data=data_model)
-                else:
-                    self.logger.info(
-                        f"Worker {worker_id}: Executing task {task['id']} - '{queue_name}' with kwargs={kwargs}"
-                    )
-                    await func(**kwargs)
-
-                # Mark task as completed
-                await self.task_queue.mark_completed(task["id"], queue_name)
+            if expects_model and model_class:
+                # Deserialize kwargs into Pydantic model
+                data_model = model_class(**kwargs)
                 self.logger.info(
-                    f"Worker {worker_id}: Task {task['id']} completed successfully."
+                    f"Worker {worker_id}: Executing task {task['id']} - '{queue_name}' with data={data_model}"
                 )
+                await func(data=data_model)
+            else:
+                self.logger.info(
+                    f"Worker {worker_id}: Executing task {task['id']} - '{queue_name}' with kwargs={kwargs}"
+                )
+                await func(**kwargs)
+
+            # Mark task as completed
+            await self.task_queue.mark_completed(task["id"], queue_name)
+            self.logger.info(
+                f"Worker {worker_id}: Task {task['id']} completed successfully."
+            )
         except Exception as e:
             self.logger.exception(
                 f"Worker {worker_id}: Error executing task {task['id']}: {e}"
@@ -565,6 +683,14 @@ class mTask:
         self.semaphores: Dict[str, asyncio.Semaphore] = {}
         self.queue_status: Dict[str, str] = {}  # Tracks status of each queue
 
+        # Locks for thread-safe access in synchronous code
+        self.task_registry_lock = threading.Lock()
+        self.queue_status_lock = threading.Lock()
+
+        # Async locks for use within async code
+        self.async_task_registry_lock = asyncio.Lock()
+        self.async_queue_status_lock = asyncio.Lock()
+
         # Set up logging
         self.logger = logging.getLogger("mTask")
         if enable_logging:
@@ -572,7 +698,7 @@ class mTask:
             if not self.logger.handlers:
                 handler = logging.StreamHandler()
                 formatter = logging.Formatter(
-                    "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+                    "%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S"
                 )
                 handler.setFormatter(formatter)
                 self.logger.addHandler(handler)
@@ -599,23 +725,25 @@ class mTask:
                 return
 
             report_data = []
-            for queue_name, task_info in self.task_registry.items():
+            queue_names = list(self.task_registry.keys())
+
+            for queue_name in queue_names:
+                task_info = self.task_registry.get(queue_name, {})
                 concurrency = task_info.get("concurrency", 1)
-                status = self.queue_status.get(queue_name, "Running")
+                status = await self._get_queue_status(queue_name)
+
                 # Get the number of tasks in the main queue
-                try:
-                    queue_length = await self.task_queue.redis.llen(queue_name)
-                except Exception as e:
-                    self.logger.error(
-                        f"Failed to get queue length for '{queue_name}': {e}"
-                    )
-                    queue_length = "N/A"
+                queue_length = await self.task_queue.get_task_count(queue_name)
+                processing_length = await self.task_queue.get_processing_task_count(
+                    queue_name
+                )
 
                 report_data.append(
                     {
                         "Queue Name": queue_name,
                         "Concurrency": concurrency,
                         "Tasks in Queue": queue_length,
+                        "Processing Tasks": processing_length,
                         "Status": status,
                     }
                 )
@@ -693,8 +821,15 @@ class mTask:
                 Callable: The wrapped function.
             """
             # Register the function and concurrency in the task_registry
-            self.task_registry[queue_name] = {"func": func, "concurrency": concurrency}
-            self.queue_status[queue_name] = "Running"  # Initialize status as Running
+            with self.task_registry_lock:
+                self.task_registry[queue_name] = {
+                    "func": func,
+                    "concurrency": concurrency,
+                }
+            with self.queue_status_lock:
+                self.queue_status[queue_name] = (
+                    "Running"  # Initialize status as Running
+                )
 
             @wraps(func)
             async def wrapper(*args, **kwargs):
@@ -882,6 +1017,7 @@ class mTask:
         worker = Worker(
             task_queue=self.task_queue,
             task_registry=self.task_registry,
+            async_task_registry_lock=self.async_task_registry_lock,
             retry_limit=self.retry_limit,
             queue_name=queue_name,
             semaphore=semaphore,  # Pass semaphore to worker
@@ -890,7 +1026,7 @@ class mTask:
         self.workers[queue_name] = worker
         asyncio.create_task(worker.start())
         self.logger.debug(
-            f"Started worker for queue '{queue_name}' with concurrency {self.task_registry[queue_name].get('concurrency', 1)}"
+            f"Started worker for queue '{queue_name}' with concurrency {semaphore._value}"
         )
 
     async def run_scheduled_tasks(self):
@@ -918,11 +1054,14 @@ class mTask:
             raise
 
         # Recover tasks from processing queues
-        for queue_name in self.task_registry.keys():
+        queue_names = list(self.task_registry.keys())
+
+        for queue_name in queue_names:
             await self.task_queue.recover_processing_tasks(queue_name)
 
         # Create and start a worker for each queue based on concurrency
-        for queue_name, task_info in self.task_registry.items():
+        for queue_name in queue_names:
+            task_info = self.task_registry.get(queue_name, {})
             concurrency = task_info.get("concurrency", 1)
             semaphore = asyncio.Semaphore(concurrency)
             self.semaphores[queue_name] = semaphore  # Save semaphore
@@ -968,6 +1107,20 @@ class mTask:
             await self.task_queue.disconnect()
             self.logger.info("mTask has been shut down due to an error.")
 
+    async def _get_queue_status(self, queue_name: str) -> str:
+        """
+        Get the status of the queue from Redis.
+
+        Args:
+            queue_name (str): Name of the Redis queue.
+
+        Returns:
+            str: Status of the queue ("Running" or "Paused").
+        """
+        status_key = f"queue_status:{queue_name}"
+        status = await self.task_queue.redis.get(status_key) or "Running"
+        return status
+
     async def pause_queue(self, queue_name: str, duration: int):
         """
         Pause all workers for a specific queue for a given duration.
@@ -996,7 +1149,27 @@ class mTask:
             # Stop the worker
             await self.workers[queue_name].stop()
 
-            self.queue_status[queue_name] = "Paused"
+            # Remove the worker from self.workers
+            del self.workers[queue_name]
+
+            # Move tasks from processing queue back to main queue (to the front)
+            processing_queue = f"{queue_name}:processing"
+            tasks = await self.task_queue.redis.lrange(processing_queue, 0, -1)
+            if tasks:
+                # Use LPUSH to add tasks to the front of the main queue
+                await self.task_queue.redis.lpush(queue_name, *tasks[::-1])
+                # Clear the processing queue
+                await self.task_queue.redis.delete(processing_queue)
+                self.logger.info(
+                    f"Moved {len(tasks)} tasks from processing queue back to main queue '{queue_name}'."
+                )
+
+            # Remove the semaphore
+            if queue_name in self.semaphores:
+                del self.semaphores[queue_name]
+
+            async with self.async_queue_status_lock:
+                self.queue_status[queue_name] = "Paused"
             self.logger.info(f"Queue '{queue_name}' paused for {duration} seconds.")
         except Exception as e:
             self.logger.exception(f"Failed to pause queue '{queue_name}': {e}")
@@ -1004,28 +1177,41 @@ class mTask:
 
     async def monitor_queue_status(self):
         """
-        Периодически проверяет статус очередей и перезапускает воркеры при необходимости.
+        Periodically checks the status of queues and restarts workers as needed.
         """
         while True:
-            for queue_name in self.task_registry.keys():
+            queue_names = list(self.task_registry.keys())
+
+            for queue_name in queue_names:
                 status_key = f"queue_status:{queue_name}"
-                current_status = await self.task_queue.redis.get(status_key)
+                current_status = (
+                    await self.task_queue.redis.get(status_key) or "Running"
+                )
                 previous_status = self.queue_status.get(queue_name, "Running")
 
                 if current_status != previous_status:
                     if current_status == "Paused":
-                        # Очередь была поставлена на паузу
-                        self.queue_status[queue_name] = "Paused"
+                        async with self.async_queue_status_lock:
+                            self.queue_status[queue_name] = "Paused"
                         self.logger.info(f"Queue '{queue_name}' is paused.")
-                        # Остановить воркеры
+                        # Stop workers
                         if queue_name in self.workers:
                             await self.workers[queue_name].stop()
-                    elif current_status is None or current_status == "Running":
-                        # Статус ключа отсутствует или очередь снова активна
-                        if previous_status == "Paused":
-                            # Очередь была в состоянии паузы, нужно возобновить
+                            # Remove the worker from self.workers
+                            del self.workers[queue_name]
+                    elif current_status == "Running" or current_status is None:
+                        async with self.async_queue_status_lock:
                             self.queue_status[queue_name] = "Running"
-                            self.logger.info(f"Queue '{queue_name}' is resumed.")
-                            self.start_worker(queue_name)
-                # Можно добавить обработку других состояний при необходимости
-            await asyncio.sleep(5)  # Проверяем статус каждые 5 секунд
+                        self.logger.info(f"Queue '{queue_name}' is resumed.")
+                        # Retrieve the concurrency setting
+                        async with self.async_task_registry_lock:
+                            task_info = self.task_registry.get(queue_name, {})
+                            concurrency = task_info.get("concurrency", 1)
+                        # Create a semaphore with correct concurrency
+                        semaphore = asyncio.Semaphore(concurrency)
+                        self.semaphores[queue_name] = semaphore  # Update the semaphore
+                        self.start_worker(queue_name, semaphore)
+                    else:
+                        # Handle other statuses if necessary
+                        pass
+            await asyncio.sleep(5)  # Check status every 5 seconds
