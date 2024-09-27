@@ -498,12 +498,10 @@ class Worker:
         Raises:
             TaskFunctionNotFoundError: If the task function is not found in the registry.
         """
-        queue_name = task["name"]  # 'name' corresponds to 'queue_name'
+        queue_name = task["name"]  # 'name' соответствует 'queue_name'
         kwargs = task.get("kwargs", {})
         async with self.async_task_registry_lock:
-            func = self.task_registry.get(queue_name, {}).get(
-                "func"
-            )  # Get the function
+            func = self.task_registry.get(queue_name, {}).get("func")  # Получаем функцию
         if not func:
             self.logger.error(f"Task function for queue '{queue_name}' not found.")
             raise TaskFunctionNotFoundError(
@@ -516,7 +514,7 @@ class Worker:
                 f"Worker {worker_id}: Executing task {task['id']} from queue '{queue_name}'"
             )
 
-            # Check if the function expects a Pydantic model
+            # Проверяем, ожидает ли функция Pydantic модель
             sig = inspect.signature(func)
             expects_model = False
             model_class: Optional[BaseModel] = None
@@ -531,7 +529,7 @@ class Worker:
                     break
 
             if expects_model and model_class:
-                # Deserialize kwargs into Pydantic model
+                # Десериализуем kwargs в Pydantic модель
                 data_model = model_class(**kwargs)
                 self.logger.info(
                     f"Worker {worker_id}: Executing task {task['id']} - '{queue_name}' with data={data_model}"
@@ -543,8 +541,6 @@ class Worker:
                 )
                 await func(**kwargs)
 
-            # Mark task as completed
-            await self.task_queue.mark_completed(task["id"], queue_name)
             self.logger.info(
                 f"Worker {worker_id}: Task {task['id']} completed successfully."
             )
@@ -567,8 +563,18 @@ class Worker:
                 self.logger.error(
                     f"Worker {worker_id}: Task {task['id']} failed after {self.retry_limit} retries."
                 )
-                # Optionally, implement further failure handling here
-
+                # Дополнительная обработка ошибки (при необходимости)
+        finally:
+            # Всегда вызываем mark_completed
+            try:
+                await self.task_queue.mark_completed(task["id"], queue_name)
+                self.logger.info(
+                    f"Worker {worker_id}: Task {task['id']} marked as completed."
+                )
+            except Exception as e:
+                self.logger.exception(
+                    f"Worker {worker_id}: Failed to mark task {task['id']} as completed: {e}"
+                )
 
 # ============================
 # ScheduledTask Class
