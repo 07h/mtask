@@ -488,20 +488,12 @@ class Worker:
                 # Depending on the error, you may choose to continue or stop
 
     async def process_task(self, task: Dict[str, Any], worker_id: int):
-        """
-        Process a single task.
-
-        Args:
-            task (Dict[str, Any]): The task data.
-            worker_id (int): Identifier for the worker.
-
-        Raises:
-            TaskFunctionNotFoundError: If the task function is not found in the registry.
-        """
         queue_name = task["name"]  # 'name' соответствует 'queue_name'
         kwargs = task.get("kwargs", {})
         async with self.async_task_registry_lock:
-            func = self.task_registry.get(queue_name, {}).get("func")  # Получаем функцию
+            task_info = self.task_registry.get(queue_name, {})
+            func = task_info.get("func")  # Получаем функцию
+            timeout = task_info.get("timeout")  # Получаем тайм-аут для задачи
         if not func:
             self.logger.error(f"Task function for queue '{queue_name}' not found.")
             raise TaskFunctionNotFoundError(
@@ -528,22 +520,51 @@ class Worker:
                     model_class = param.annotation
                     break
 
+            # Выполняем задачу с тайм-аутом
             if expects_model and model_class:
                 # Десериализуем kwargs в Pydantic модель
                 data_model = model_class(**kwargs)
                 self.logger.info(
                     f"Worker {worker_id}: Executing task {task['id']} - '{queue_name}' with data={data_model}"
                 )
-                await func(data=data_model)
+                # Используем asyncio.wait_for для установки тайм-аута
+                if timeout:
+                    await asyncio.wait_for(func(data=data_model), timeout=timeout)
+                else:
+                    await func(data=data_model)
             else:
                 self.logger.info(
                     f"Worker {worker_id}: Executing task {task['id']} - '{queue_name}' with kwargs={kwargs}"
                 )
-                await func(**kwargs)
+                # Используем asyncio.wait_for для установки тайм-аута
+                if timeout:
+                    await asyncio.wait_for(func(**kwargs), timeout=timeout)
+                else:
+                    await func(**kwargs)
 
             self.logger.info(
                 f"Worker {worker_id}: Task {task['id']} completed successfully."
             )
+        except asyncio.TimeoutError:
+            self.logger.error(
+                f"Worker {worker_id}: Task {task['id']} exceeded timeout of {timeout} seconds."
+            )
+            if task["retry_count"] < self.retry_limit:
+                task["retry_count"] += 1
+                try:
+                    await self.task_queue.requeue(task, queue_name=self.queue_name)
+                    self.logger.info(
+                        f"Worker {worker_id}: Requeued task {task['id']} due to timeout (retry {task['retry_count']})"
+                    )
+                except TaskRequeueError as re:
+                    self.logger.error(
+                        f"Worker {worker_id}: Failed to requeue task {task['id']}: {re}"
+                    )
+            else:
+                self.logger.error(
+                    f"Worker {worker_id}: Task {task['id']} failed after exceeding timeout and {self.retry_limit} retries."
+                )
+                # Дополнительная обработка ошибки (при необходимости)
         except Exception as e:
             self.logger.exception(
                 f"Worker {worker_id}: Error executing task {task['id']}: {e}"
@@ -575,6 +596,7 @@ class Worker:
                 self.logger.exception(
                     f"Worker {worker_id}: Failed to mark task {task['id']} as completed: {e}"
                 )
+
 
 # ============================
 # ScheduledTask Class
@@ -804,6 +826,7 @@ class mTask:
         self,
         queue_name: str = "default",
         concurrency: int = 1,
+        timeout: Optional[int] = None,
     ):
         """
         Decorator to define and register a task.
@@ -811,6 +834,7 @@ class mTask:
         Args:
             queue_name (str, optional): Redis queue name to enqueue the task.
             concurrency (int, optional): Maximum concurrent executions for the task.
+            timeout (int, optional): Maximum execution time for tasks in this queue. Seconds.
 
         Returns:
             Callable: The decorator.
@@ -826,11 +850,12 @@ class mTask:
             Returns:
                 Callable: The wrapped function.
             """
-            # Register the function and concurrency in the task_registry
+            # Register the function, concurrency, and timeout in the task_registry
             with self.task_registry_lock:
                 self.task_registry[queue_name] = {
                     "func": func,
                     "concurrency": concurrency,
+                    "timeout": timeout,  # Сохраняем тайм-аут для задачи
                 }
             with self.queue_status_lock:
                 self.queue_status[queue_name] = (

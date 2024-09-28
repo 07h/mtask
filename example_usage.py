@@ -23,11 +23,11 @@ class TaskData(BaseModel):
 
 
 # Define a task using the @agent decorator with concurrency
-@mtask.agent(queue_name="default", concurrency=2)
+@mtask.agent(queue_name="default", concurrency=2, timeout=5)
 async def process_data(data: TaskData):
     """Process the data"""
     print(f"Processing data: {data.value}")
-    await asyncio.sleep(1)  # Simulate some processing time
+    await asyncio.sleep(120)  # Simulate some processing time
 
     # Enqueue a new task from within a task
     if data.value < 5:
