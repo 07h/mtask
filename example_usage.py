@@ -1,8 +1,17 @@
 # example_usage.py
 
 import asyncio
+import sys
 import logging
 from pydantic import BaseModel
+
+# Use uvloop for better performance on Unix systems
+if sys.platform != 'win32':
+    try:
+        import uvloop
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    except ImportError:
+        pass
 
 # Import the mTask class from the mTask library
 from mtask import mTask

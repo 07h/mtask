@@ -1,6 +1,13 @@
 # mTask.py
 
 import asyncio
+
+# Use uvloop for better performance on Unix systems
+
+import uvloop
+asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+
+
 import inspect
 import json
 import logging

@@ -10,6 +10,7 @@ croniter = "<3.0.0"
 pydantic = "^2.4.2"
 python = ">=3.8"
 redis = "^5.0.0"
+uvloop = "^0.21.0"
 
 [tool.poetry.dev-dependencies]
 black = "^21"
