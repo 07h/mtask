@@ -146,31 +146,51 @@ class TaskQueue:
         self._connect_lock = asyncio.Lock()
 
     async def connect(self):
-        try:
-            self.redis = redis.from_url(
-                self.redis_url,
-                encoding="utf-8",
-                decode_responses=True,
-                max_connections=self.max_connections,
-                socket_timeout=self.operation_timeout,
-                socket_connect_timeout=self.connect_timeout,
-                retry_on_timeout=True,
-            )
-            await asyncio.wait_for(self.redis.ping(), timeout=self.connect_timeout)
-            self._connection_healthy = True
-            self.logger.info(f"Connected to Redis at {self.redis_url}")
-            
-            # Start health check in background
-            if not self._health_check_task or self._health_check_task.done():
-                self._health_check_task = asyncio.create_task(self._health_check_loop())
-        except asyncio.TimeoutError:
-            self._connection_healthy = False
-            self.logger.error(f"Connection to Redis timed out after {self.connect_timeout}s")
-            raise RedisConnectionError(f"Connection to Redis timed out after {self.connect_timeout}s")
-        except Exception as e:
-            self._connection_healthy = False
-            self.logger.exception(f"Failed to connect to Redis: {e}")
-            raise RedisConnectionError(f"Failed to connect to Redis: {e}") from e
+        # Avoid repeated connects/log spam if we're already connected.
+        if self.redis is not None and self._connection_healthy:
+            return
+
+        async with self._connect_lock:
+            # Re-check under lock
+            if self.redis is not None and self._connection_healthy:
+                return
+
+            try:
+                # If a client exists but is unhealthy, close it before recreating.
+                if self.redis is not None:
+                    try:
+                        await self.redis.close()
+                    except Exception:
+                        pass
+
+                self.redis = redis.from_url(
+                    self.redis_url,
+                    encoding="utf-8",
+                    decode_responses=True,
+                    max_connections=self.max_connections,
+                    socket_timeout=self.operation_timeout,
+                    socket_connect_timeout=self.connect_timeout,
+                    retry_on_timeout=True,
+                )
+                await asyncio.wait_for(self.redis.ping(), timeout=self.connect_timeout)
+                self._connection_healthy = True
+                self.logger.info(f"Connected to Redis at {self.redis_url}")
+
+                # Start health check in background
+                if not self._health_check_task or self._health_check_task.done():
+                    self._health_check_task = asyncio.create_task(self._health_check_loop())
+            except asyncio.TimeoutError:
+                self._connection_healthy = False
+                self.logger.error(
+                    f"Connection to Redis timed out after {self.connect_timeout}s"
+                )
+                raise RedisConnectionError(
+                    f"Connection to Redis timed out after {self.connect_timeout}s"
+                )
+            except Exception as e:
+                self._connection_healthy = False
+                self.logger.exception(f"Failed to connect to Redis: {e}")
+                raise RedisConnectionError(f"Failed to connect to Redis: {e}") from e
 
     async def disconnect(self):
         # Stop health check
@@ -1485,14 +1505,9 @@ class mTask:
 
     async def connect_and_start_workers(self):
         try:
-            self.task_queue = TaskQueue(
-                redis_url=self._redis_url,
-                logger=self.logger,
-                operation_timeout=self._redis_operation_timeout,
-                connect_timeout=self._redis_connect_timeout,
-                max_connections=self._redis_max_connections,
-                health_check_interval=self._redis_health_check_interval,
-            )
+            # Reuse the TaskQueue created in __init__ to avoid repeated connects/log spam
+            # and duplicated health-check loops.
+            self.task_queue.logger = self.logger
             await self.task_queue.connect()
         except RedisConnectionError as e:
             self.logger.error(f"Cannot start workers without Redis connection: {e}")
