@@ -143,6 +143,7 @@ class TaskQueue:
         self._connection_healthy = False
         self._health_check_task: Optional[asyncio.Task] = None
         self._reconnecting = False
+        self._connect_lock = asyncio.Lock()
 
     async def connect(self):
         try:
@@ -184,6 +185,38 @@ class TaskQueue:
             await self.redis.close()
             self._connection_healthy = False
             self.logger.info("Disconnected from Redis")
+
+    async def ensure_connected(self) -> None:
+        """Ensure Redis client is initialized and responsive.
+
+        This prevents producer-side usage errors where enqueue() is called before connect(),
+        and also provides a safe fast-path during normal operation.
+        """
+        # Fast path: client exists and marked healthy
+        if self.redis is not None and self._connection_healthy:
+            return
+
+        async with self._connect_lock:
+            # Re-check under lock
+            if self.redis is not None and self._connection_healthy:
+                return
+
+            # If no client yet, do a normal connect
+            if self.redis is None:
+                await self.connect()
+                return
+
+            # Client exists but considered unhealthy -> try a ping, then reconnect if needed
+            try:
+                await asyncio.wait_for(self.redis.ping(), timeout=self.operation_timeout)
+                self._connection_healthy = True
+            except Exception:
+                self._connection_healthy = False
+                await self._reconnect()
+
+        # If reconnection failed, raise
+        if self.redis is None or not self._connection_healthy:
+            raise RedisConnectionError("Redis is not connected.")
     
     async def _reconnect(self):
         """Attempt to reconnect to Redis with exponential backoff."""
@@ -270,9 +303,7 @@ class TaskQueue:
         priority: int = 0,
         max_task_size: int = 1024 * 1024,
     ) -> str:
-        if not self.redis:
-            self.logger.error("Redis is not connected.")
-            raise RedisConnectionError("Redis is not connected.")
+        await self.ensure_connected()
 
         task = {
             "id": str(uuid.uuid4()),
@@ -317,9 +348,7 @@ class TaskQueue:
             raise TaskEnqueueError(f"Failed to enqueue task: {e}") from e
 
     async def dequeue(self, queue_name: str = "default") -> Optional[Dict[str, Any]]:
-        if not self.redis:
-            self.logger.error("Redis is not connected.")
-            raise RedisConnectionError("Redis is not connected.")
+        await self.ensure_connected()
 
         processing_queue = f"{queue_name}:processing"
         priority_queue = f"{queue_name}:priority"
@@ -428,9 +457,7 @@ class TaskQueue:
             ) from e
 
     async def requeue(self, task: Dict[str, Any], queue_name: str = "default", apply_backoff: bool = True) -> None:
-        if not self.redis:
-            self.logger.error("Redis is not connected.")
-            raise RedisConnectionError("Redis is not connected.")
+        await self.ensure_connected()
 
         task["status"] = "pending"
         task.pop("start_time", None)
@@ -474,6 +501,7 @@ class TaskQueue:
 
     async def mark_completed(self, task_id: str, queue_name: str) -> None:
         processing_queue = f"{queue_name}:processing"
+        await self.ensure_connected()
         try:
             # O(1) operation using Hash instead of O(n) list scan
             deleted = await asyncio.wait_for(
@@ -499,6 +527,7 @@ class TaskQueue:
 
     async def recover_processing_tasks(self, queue_name: str, batch_size: int = 100):
         """Recover tasks from processing queue (Hash) back to main queue using batches."""
+        await self.ensure_connected()
         processing_queue = f"{queue_name}:processing"
         main_queue = queue_name
         try:
@@ -602,6 +631,7 @@ class TaskQueue:
 
     async def get_task_count(self, queue_name: str) -> int:
         try:
+            await self.ensure_connected()
             count = await asyncio.wait_for(
                 self.redis.llen(queue_name),
                 timeout=self.operation_timeout
@@ -617,6 +647,7 @@ class TaskQueue:
     async def get_processing_task_count(self, queue_name: str) -> int:
         processing_queue = f"{queue_name}:processing"
         try:
+            await self.ensure_connected()
             # Use hlen for Hash (new format)
             key_type = await self.redis.type(processing_queue)
             if key_type == "hash":
