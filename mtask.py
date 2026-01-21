@@ -128,12 +128,18 @@ class TaskQueue:
         logger: Optional[logging.Logger] = None,
         health_check_interval: int = 30,
         max_reconnect_attempts: int = 5,
+        operation_timeout: float = 5.0,
+        connect_timeout: float = 10.0,
+        max_connections: int = 150,
     ):
         self.redis_url = redis_url
         self.redis: Optional[redis.Redis] = None
         self.logger = logger or logging.getLogger("TaskQueue")
         self.health_check_interval = health_check_interval
         self.max_reconnect_attempts = max_reconnect_attempts
+        self.operation_timeout = operation_timeout
+        self.connect_timeout = connect_timeout
+        self.max_connections = max_connections
         self._connection_healthy = False
         self._health_check_task: Optional[asyncio.Task] = None
         self._reconnecting = False
@@ -141,15 +147,25 @@ class TaskQueue:
     async def connect(self):
         try:
             self.redis = redis.from_url(
-                self.redis_url, encoding="utf-8", decode_responses=True
+                self.redis_url,
+                encoding="utf-8",
+                decode_responses=True,
+                max_connections=self.max_connections,
+                socket_timeout=self.operation_timeout,
+                socket_connect_timeout=self.connect_timeout,
+                retry_on_timeout=True,
             )
-            await self.redis.ping()
+            await asyncio.wait_for(self.redis.ping(), timeout=self.connect_timeout)
             self._connection_healthy = True
             self.logger.info(f"Connected to Redis at {self.redis_url}")
             
             # Start health check in background
             if not self._health_check_task or self._health_check_task.done():
                 self._health_check_task = asyncio.create_task(self._health_check_loop())
+        except asyncio.TimeoutError:
+            self._connection_healthy = False
+            self.logger.error(f"Connection to Redis timed out after {self.connect_timeout}s")
+            raise RedisConnectionError(f"Connection to Redis timed out after {self.connect_timeout}s")
         except Exception as e:
             self._connection_healthy = False
             self.logger.exception(f"Failed to connect to Redis: {e}")
@@ -192,13 +208,21 @@ class TaskQueue:
                     await self.redis.close()
                 
                 self.redis = redis.from_url(
-                    self.redis_url, encoding="utf-8", decode_responses=True
+                    self.redis_url,
+                    encoding="utf-8",
+                    decode_responses=True,
+                    max_connections=self.max_connections,
+                    socket_timeout=self.operation_timeout,
+                    socket_connect_timeout=self.connect_timeout,
+                    retry_on_timeout=True,
                 )
-                await self.redis.ping()
+                await asyncio.wait_for(self.redis.ping(), timeout=self.connect_timeout)
                 self._connection_healthy = True
                 self.logger.info("Successfully reconnected to Redis")
                 self._reconnecting = False
                 return
+            except asyncio.TimeoutError:
+                self.logger.error(f"Reconnection attempt {attempt} timed out after {self.connect_timeout}s")
             except Exception as e:
                 self.logger.error(f"Reconnection attempt {attempt} failed: {e}")
         
@@ -214,7 +238,7 @@ class TaskQueue:
                 await asyncio.sleep(self.health_check_interval)
                 
                 if self.redis:
-                    await self.redis.ping()
+                    await asyncio.wait_for(self.redis.ping(), timeout=self.operation_timeout)
                     if not self._connection_healthy:
                         self._connection_healthy = True
                         self.logger.info("Redis connection healthy")
@@ -223,13 +247,21 @@ class TaskQueue:
                     
             except asyncio.CancelledError:
                 break
+            except asyncio.TimeoutError:
+                if self._connection_healthy:
+                    self._connection_healthy = False
+                    self.logger.error(f"Redis health check timed out after {self.operation_timeout}s")
+                # Attempt to reconnect in background task to not block health check loop
+                if not self._reconnecting:
+                    asyncio.create_task(self._reconnect())
             except Exception as e:
                 if self._connection_healthy:
                     self._connection_healthy = False
                     self.logger.error(f"Redis health check failed: {e}")
                 
-                # Attempt to reconnect
-                await self._reconnect()
+                # Attempt to reconnect in background task to not block health check loop
+                if not self._reconnecting:
+                    asyncio.create_task(self._reconnect())
 
     async def enqueue(
         self,
@@ -264,13 +296,22 @@ class TaskQueue:
                 # Use sorted set for priority queues (higher score = higher priority)
                 # Use negative timestamp as tiebreaker for same priority
                 score = priority * 1000000 - datetime.utcnow().timestamp()
-                await self.redis.zadd(f"{queue_name}:priority", {task_json: score})
+                await asyncio.wait_for(
+                    self.redis.zadd(f"{queue_name}:priority", {task_json: score}),
+                    timeout=self.operation_timeout
+                )
                 self.logger.debug(f"Enqueued task {task['id']} to priority queue '{queue_name}' with priority {priority}")
             else:
                 # Use regular list for non-priority tasks (backward compatible)
-                await self.redis.rpush(queue_name, task_json)
+                await asyncio.wait_for(
+                    self.redis.rpush(queue_name, task_json),
+                    timeout=self.operation_timeout
+                )
                 self.logger.debug(f"Enqueued task {task['id']} to queue '{queue_name}'")
             return task["id"]
+        except asyncio.TimeoutError:
+            self.logger.error(f"Enqueue operation timed out after {self.operation_timeout}s")
+            raise TaskEnqueueError(f"Enqueue operation timed out after {self.operation_timeout}s")
         except Exception as e:
             self.logger.exception(f"Failed to enqueue task: {e}")
             raise TaskEnqueueError(f"Failed to enqueue task: {e}") from e
@@ -285,7 +326,10 @@ class TaskQueue:
         
         try:
             # Try priority queue first
-            priority_tasks = await self.redis.zpopmax(priority_queue, 1)
+            priority_tasks = await asyncio.wait_for(
+                self.redis.zpopmax(priority_queue, 1),
+                timeout=self.operation_timeout
+            )
             if priority_tasks:
                 task_json, _ = priority_tasks[0]
                 task = json.loads(task_json)
@@ -303,47 +347,78 @@ class TaskQueue:
                         )
                         # Re-add with adjusted score to maintain order
                         score = task.get("priority", 0) * 1000000 - retry_after
-                        await self.redis.zadd(priority_queue, {task_json: score})
+                        await asyncio.wait_for(
+                            self.redis.zadd(priority_queue, {task_json: score}),
+                            timeout=self.operation_timeout
+                        )
                         return None
                     else:
                         # Backoff period expired, remove the marker
                         task.pop("retry_after", None)
                 
-                await self.redis.rpush(processing_queue, json.dumps(task))
+                # Store in processing Hash (O(1) for mark_completed)
+                final_task_json = task_json if "retry_after" not in task_json else json.dumps(task)
+                await asyncio.wait_for(
+                    self.redis.hset(processing_queue, task["id"], final_task_json),
+                    timeout=self.operation_timeout
+                )
                 self.logger.debug(
                     f"Dequeued priority task {task['id']} from queue '{queue_name}' to processing '{processing_queue}'"
                 )
                 return task
             
-            # Fall back to regular queue (shorter timeout for faster priority queue checking)
-            task_tuple = await self.redis.blpop(queue_name, timeout=1)
-            if task_tuple:
-                _, task_json = task_tuple
-                task = json.loads(task_json)
-                
-                # Check if task has backoff delay
-                retry_after = task.get("retry_after")
-                if retry_after:
-                    current_time = datetime.utcnow().timestamp()
-                    if current_time < retry_after:
-                        wait_time = retry_after - current_time
-                        self.logger.debug(
-                            f"Task {task['id']} still in backoff period, re-enqueueing "
-                            f"(wait {wait_time:.1f}s more)"
-                        )
-                        # Re-add to back of queue
-                        await self.redis.rpush(queue_name, task_json)
-                        return None
-                    else:
-                        # Backoff period expired, remove the marker
-                        task.pop("retry_after", None)
-                
-                await self.redis.rpush(processing_queue, json.dumps(task))
-                self.logger.debug(
-                    f"Dequeued task {task['id']} from queue '{queue_name}' to processing '{processing_queue}'"
+            # Fall back to regular queue - try atomic LMOVE first (Redis 6.2+)
+            task_json = None
+            try:
+                # LMOVE atomically moves element from source to destination
+                # We move to a temp list first, then to hash
+                task_json = await asyncio.wait_for(
+                    self.redis.lpop(queue_name),
+                    timeout=self.operation_timeout
                 )
-                return task
-            return None
+            except Exception:
+                # Fallback for older Redis or if lpop fails
+                pass
+            
+            if not task_json:
+                # No task available, short sleep to avoid busy loop
+                return None
+                
+            task = json.loads(task_json)
+            
+            # Check if task has backoff delay
+            retry_after = task.get("retry_after")
+            if retry_after:
+                current_time = datetime.utcnow().timestamp()
+                if current_time < retry_after:
+                    wait_time = retry_after - current_time
+                    self.logger.debug(
+                        f"Task {task['id']} still in backoff period, re-enqueueing "
+                        f"(wait {wait_time:.1f}s more)"
+                    )
+                    # Re-add to back of queue
+                    await asyncio.wait_for(
+                        self.redis.rpush(queue_name, task_json),
+                        timeout=self.operation_timeout
+                    )
+                    return None
+                else:
+                    # Backoff period expired, remove the marker
+                    task.pop("retry_after", None)
+            
+            # Store in processing Hash (O(1) for mark_completed)
+            final_task_json = task_json if "retry_after" not in task_json else json.dumps(task)
+            await asyncio.wait_for(
+                self.redis.hset(processing_queue, task["id"], final_task_json),
+                timeout=self.operation_timeout
+            )
+            self.logger.debug(
+                f"Dequeued task {task['id']} from queue '{queue_name}' to processing '{processing_queue}'"
+            )
+            return task
+        except asyncio.TimeoutError:
+            self.logger.error(f"Dequeue operation timed out after {self.operation_timeout}s")
+            raise TaskDequeueError(f"Dequeue operation timed out after {self.operation_timeout}s")
         except Exception as e:
             self.logger.exception(
                 f"Failed to dequeue task from queue '{queue_name}': {e}"
@@ -374,16 +449,25 @@ class TaskQueue:
             if priority > 0:
                 # Re-enqueue to priority queue
                 score = priority * 1000000 - datetime.utcnow().timestamp()
-                await self.redis.zadd(f"{queue_name}:priority", {json.dumps(task): score})
+                await asyncio.wait_for(
+                    self.redis.zadd(f"{queue_name}:priority", {json.dumps(task): score}),
+                    timeout=self.operation_timeout
+                )
                 self.logger.debug(
                     f"Requeued task {task['id']} to priority queue '{queue_name}' (retry {task['retry_count']})"
                 )
             else:
                 # Re-enqueue to regular queue
-                await self.redis.rpush(queue_name, json.dumps(task))
+                await asyncio.wait_for(
+                    self.redis.rpush(queue_name, json.dumps(task)),
+                    timeout=self.operation_timeout
+                )
                 self.logger.debug(
                     f"Requeued task {task['id']} to queue '{queue_name}' (retry {task['retry_count']})"
                 )
+        except asyncio.TimeoutError:
+            self.logger.error(f"Requeue operation timed out after {self.operation_timeout}s")
+            raise TaskRequeueError(f"Requeue operation timed out after {self.operation_timeout}s")
         except Exception as e:
             self.logger.exception(f"Failed to requeue task '{task['id']}': {e}")
             raise TaskRequeueError(f"Failed to requeue task '{task['id']}': {e}") from e
@@ -391,15 +475,22 @@ class TaskQueue:
     async def mark_completed(self, task_id: str, queue_name: str) -> None:
         processing_queue = f"{queue_name}:processing"
         try:
-            tasks = await self.redis.lrange(processing_queue, 0, -1)
-            for task_json in tasks:
-                task = json.loads(task_json)
-                if task["id"] == task_id:
-                    await self.redis.lrem(processing_queue, 0, task_json)
-                    self.logger.info(
-                        f"Task {task_id} marked as completed and removed from processing '{processing_queue}'."
-                    )
-                    break
+            # O(1) operation using Hash instead of O(n) list scan
+            deleted = await asyncio.wait_for(
+                self.redis.hdel(processing_queue, task_id),
+                timeout=self.operation_timeout
+            )
+            if deleted:
+                self.logger.info(
+                    f"Task {task_id} marked as completed and removed from processing '{processing_queue}'."
+                )
+            else:
+                self.logger.warning(
+                    f"Task {task_id} was not found in processing queue '{processing_queue}'."
+                )
+        except asyncio.TimeoutError:
+            self.logger.error(f"Mark completed operation timed out after {self.operation_timeout}s")
+            raise TaskProcessingError(f"Mark completed operation timed out after {self.operation_timeout}s")
         except Exception as e:
             self.logger.exception(f"Failed to mark task {task_id} as completed: {e}")
             raise TaskProcessingError(
@@ -407,51 +498,118 @@ class TaskQueue:
             ) from e
 
     async def recover_processing_tasks(self, queue_name: str, batch_size: int = 100):
-        """Recover tasks from processing queue back to main queue using batches."""
+        """Recover tasks from processing queue (Hash) back to main queue using batches."""
         processing_queue = f"{queue_name}:processing"
         main_queue = queue_name
         try:
-            total_tasks = await self.redis.llen(processing_queue)
-            if total_tasks == 0:
+            # First check if the key exists and its type
+            key_type = await asyncio.wait_for(
+                self.redis.type(processing_queue),
+                timeout=self.operation_timeout
+            )
+            
+            if key_type == "none":
                 return
             
-            recovered = 0
-            while recovered < total_tasks:
-                # Process in batches to avoid memory issues
-                batch_tasks = await self.redis.lrange(
-                    processing_queue, recovered, recovered + batch_size - 1
+            # Handle migration from old List format to new Hash format
+            if key_type == "list":
+                await self._migrate_processing_list_to_hash(queue_name)
+                key_type = "hash"
+            
+            if key_type != "hash":
+                self.logger.warning(
+                    f"Processing queue '{processing_queue}' has unexpected type '{key_type}', skipping recovery"
                 )
+                return
+            
+            # Get all tasks from Hash
+            tasks = await asyncio.wait_for(
+                self.redis.hgetall(processing_queue),
+                timeout=self.operation_timeout
+            )
+            
+            if not tasks:
+                return
+            
+            total_tasks = len(tasks)
+            recovered = 0
+            
+            # Process in batches using pipeline
+            task_items = list(tasks.items())
+            for i in range(0, len(task_items), batch_size):
+                batch = task_items[i:i + batch_size]
                 
-                if not batch_tasks:
-                    break
-                
-                # Use pipeline for efficient batch operations
                 pipe = self.redis.pipeline()
-                for task_json in reversed(batch_tasks):
+                for task_id, task_json in batch:
                     pipe.lpush(main_queue, task_json)
                 await pipe.execute()
                 
-                recovered += len(batch_tasks)
+                recovered += len(batch)
                 
-                if recovered % 500 == 0:  # Progress logging
+                if recovered % 500 == 0 and recovered < total_tasks:
                     self.logger.info(
                         f"Recovery progress: {recovered}/{total_tasks} tasks moved from '{processing_queue}' to '{main_queue}'"
                     )
             
-            # Delete processing queue after successful recovery
-            await self.redis.delete(processing_queue)
+            # Delete processing hash after successful recovery
+            await asyncio.wait_for(
+                self.redis.delete(processing_queue),
+                timeout=self.operation_timeout
+            )
             self.logger.info(
                 f"Recovered {recovered} tasks from processing '{processing_queue}' back to main '{main_queue}'."
             )
+        except asyncio.TimeoutError:
+            self.logger.error(f"Recovery operation timed out after {self.operation_timeout}s")
         except Exception as e:
             self.logger.exception(
                 f"Failed to recover tasks from processing queue '{processing_queue}': {e}"
             )
+    
+    async def _migrate_processing_list_to_hash(self, queue_name: str):
+        """Migrate processing queue from List to Hash format (one-time migration)."""
+        processing_queue = f"{queue_name}:processing"
+        self.logger.info(f"Migrating processing queue '{processing_queue}' from List to Hash format...")
+        
+        try:
+            # Get all tasks from List
+            tasks = await asyncio.wait_for(
+                self.redis.lrange(processing_queue, 0, -1),
+                timeout=self.operation_timeout
+            )
+            
+            if not tasks:
+                await self.redis.delete(processing_queue)
+                return
+            
+            # Convert to Hash
+            temp_hash = f"{processing_queue}:migration_temp"
+            pipe = self.redis.pipeline()
+            for task_json in tasks:
+                task = json.loads(task_json)
+                pipe.hset(temp_hash, task["id"], task_json)
+            await pipe.execute()
+            
+            # Atomic rename (delete old, rename temp)
+            await self.redis.delete(processing_queue)
+            await self.redis.rename(temp_hash, processing_queue)
+            
+            self.logger.info(
+                f"Successfully migrated {len(tasks)} tasks in '{processing_queue}' from List to Hash format."
+            )
+        except Exception as e:
+            self.logger.exception(f"Failed to migrate processing queue '{processing_queue}': {e}")
 
     async def get_task_count(self, queue_name: str) -> int:
         try:
-            count = await self.redis.llen(queue_name)
+            count = await asyncio.wait_for(
+                self.redis.llen(queue_name),
+                timeout=self.operation_timeout
+            )
             return count
+        except asyncio.TimeoutError:
+            self.logger.error(f"Get task count timed out after {self.operation_timeout}s")
+            return 0
         except Exception as e:
             self.logger.error(f"Failed to get task count for '{queue_name}': {e}")
             return 0
@@ -459,7 +617,15 @@ class TaskQueue:
     async def get_processing_task_count(self, queue_name: str) -> int:
         processing_queue = f"{queue_name}:processing"
         try:
-            count = await self.redis.llen(processing_queue)
+            # Use hlen for Hash (new format)
+            key_type = await self.redis.type(processing_queue)
+            if key_type == "hash":
+                count = await self.redis.hlen(processing_queue)
+            elif key_type == "list":
+                # Backward compatibility with old List format
+                count = await self.redis.llen(processing_queue)
+            else:
+                count = 0
             return count
         except Exception as e:
             self.logger.error(
@@ -538,15 +704,18 @@ class Worker:
     async def _worker_loop(self, worker_id: int):
         while self._running:
             try:
-                async with self.semaphore:
-                    task = await self.task_queue.dequeue(queue_name=self.queue_name)
-                    if task:
-                        self.logger.info(
-                            f"Worker {worker_id}: Dequeued task {task['id']} from queue '{self.queue_name}'"
-                        )
+                # Dequeue outside semaphore to avoid blocking other workers
+                task = await self.task_queue.dequeue(queue_name=self.queue_name)
+                if task:
+                    self.logger.info(
+                        f"Worker {worker_id}: Dequeued task {task['id']} from queue '{self.queue_name}'"
+                    )
+                    # Only acquire semaphore for task execution
+                    async with self.semaphore:
                         await self.process_task(task, worker_id)
-                    else:
-                        await asyncio.sleep(1)
+                else:
+                    # Sleep outside semaphore - short sleep to be responsive
+                    await asyncio.sleep(0.1)
             except asyncio.CancelledError:
                 self.logger.info(f"Worker {worker_id}: Received shutdown signal.")
                 break
@@ -590,11 +759,12 @@ class Worker:
         self._active_tasks += 1
         
         try:
-            async with self.task_registry_lock:
-                task_info = self.task_registry.get(queue_name, {})
-                func = task_info.get("func")
-                timeout = task_info.get("timeout")
-                on_task_requeued = task_info.get("on_task_requeued")
+            # Read without lock - task_registry is immutable after startup
+            # Python dict.get() is thread-safe for simple reads due to GIL
+            task_info = self.task_registry.get(queue_name, {})
+            func = task_info.get("func")
+            timeout = task_info.get("timeout")
+            on_task_requeued = task_info.get("on_task_requeued")
             
             if not func:
                 self.logger.error(f"Task function for queue '{queue_name}' not found.")
@@ -783,6 +953,11 @@ class mTask:
         shutdown_timeout: int = 30,
         enable_dlq: bool = True,
         max_task_size: int = 1024 * 1024,
+        # New optional Redis parameters
+        redis_operation_timeout: float = 5.0,
+        redis_connect_timeout: float = 10.0,
+        redis_max_connections: int = 50,
+        redis_health_check_interval: int = 30,
     ):
         # Validate parameters
         if retry_limit < 0:
@@ -793,8 +968,27 @@ class mTask:
             raise ValueError("max_task_size must be > 0")
         if not redis_url or not isinstance(redis_url, str):
             raise ValueError("redis_url must be a non-empty string")
+        if redis_operation_timeout <= 0:
+            raise ValueError("redis_operation_timeout must be > 0")
+        if redis_connect_timeout <= 0:
+            raise ValueError("redis_connect_timeout must be > 0")
+        if redis_max_connections <= 0:
+            raise ValueError("redis_max_connections must be > 0")
         
-        self.task_queue = TaskQueue(redis_url=redis_url)
+        # Store Redis parameters for TaskQueue creation
+        self._redis_url = redis_url
+        self._redis_operation_timeout = redis_operation_timeout
+        self._redis_connect_timeout = redis_connect_timeout
+        self._redis_max_connections = redis_max_connections
+        self._redis_health_check_interval = redis_health_check_interval
+        
+        self.task_queue = TaskQueue(
+            redis_url=redis_url,
+            operation_timeout=redis_operation_timeout,
+            connect_timeout=redis_connect_timeout,
+            max_connections=redis_max_connections,
+            health_check_interval=redis_health_check_interval,
+        )
         self.task_registry: Dict[str, Dict[str, Any]] = {}
         self.workers: Dict[str, Worker] = {}
         self.scheduled_tasks: List[ScheduledTask] = []
@@ -1261,7 +1455,12 @@ class mTask:
     async def connect_and_start_workers(self):
         try:
             self.task_queue = TaskQueue(
-                redis_url=self.task_queue.redis_url, logger=self.logger
+                redis_url=self._redis_url,
+                logger=self.logger,
+                operation_timeout=self._redis_operation_timeout,
+                connect_timeout=self._redis_connect_timeout,
+                max_connections=self._redis_max_connections,
+                health_check_interval=self._redis_health_check_interval,
             )
             await self.task_queue.connect()
         except RedisConnectionError as e:
@@ -1353,14 +1552,31 @@ class mTask:
             await self.workers[queue_name].stop()
             del self.workers[queue_name]
 
+            # Move tasks from processing queue back to main queue
             processing_queue = f"{queue_name}:processing"
-            tasks = await self.task_queue.redis.lrange(processing_queue, 0, -1)
-            if tasks:
-                await self.task_queue.redis.lpush(queue_name, *tasks[::-1])
-                await self.task_queue.redis.delete(processing_queue)
-                self.logger.info(
-                    f"Moved {len(tasks)} tasks from processing queue back to main queue '{queue_name}'."
-                )
+            key_type = await self.task_queue.redis.type(processing_queue)
+            
+            if key_type == "hash":
+                # New Hash format
+                tasks = await self.task_queue.redis.hgetall(processing_queue)
+                if tasks:
+                    pipe = self.task_queue.redis.pipeline()
+                    for task_id, task_json in tasks.items():
+                        pipe.lpush(queue_name, task_json)
+                    await pipe.execute()
+                    await self.task_queue.redis.delete(processing_queue)
+                    self.logger.info(
+                        f"Moved {len(tasks)} tasks from processing queue back to main queue '{queue_name}'."
+                    )
+            elif key_type == "list":
+                # Old List format (backward compatibility)
+                tasks = await self.task_queue.redis.lrange(processing_queue, 0, -1)
+                if tasks:
+                    await self.task_queue.redis.lpush(queue_name, *tasks[::-1])
+                    await self.task_queue.redis.delete(processing_queue)
+                    self.logger.info(
+                        f"Moved {len(tasks)} tasks from processing queue back to main queue '{queue_name}'."
+                    )
 
             if queue_name in self.semaphores:
                 del self.semaphores[queue_name]
