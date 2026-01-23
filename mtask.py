@@ -1005,9 +1005,10 @@ class Worker:
             self._active_tasks -= 1
             try:
                 # Use _task_json stored by dequeue() for LREM
+                # Note: use self.queue_name (worker's queue), not queue_name (task's name)
                 task_json = task.get("_task_json")
                 if task_json:
-                    await self.task_queue.mark_completed(task_json, queue_name)
+                    await self.task_queue.mark_completed(task_json, self.queue_name)
                     self.logger.info(
                         f"Worker {worker_id}: Task {task['id']} marked as completed."
                     )
