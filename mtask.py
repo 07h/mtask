@@ -698,7 +698,7 @@ class Worker:
         task_registry_lock: asyncio.Lock,
         retry_limit: int = 3,
         queue_name: str = "default",
-        semaphore: Optional[asyncio.Semaphore] = None,
+        concurrency: int = 1,
         logger: Optional[logging.Logger] = None,
         enable_dlq: bool = True,
         move_to_dlq_callback: Optional[Callable] = None,
@@ -709,7 +709,7 @@ class Worker:
         self.queue_name = queue_name
         self.task_registry = task_registry
         self.task_registry_lock = task_registry_lock
-        self.semaphore = semaphore if semaphore else asyncio.Semaphore(1)
+        self.concurrency = concurrency
         self._running = False
         self._workers: List[asyncio.Task] = []
         self._active_tasks: int = 0
@@ -719,7 +719,7 @@ class Worker:
         self.record_metric_callback = record_metric_callback
 
         self.logger.debug(
-            f"Worker initialized with concurrency={self.semaphore._value} for queue '{queue_name}'"
+            f"Worker initialized with concurrency={concurrency} for queue '{queue_name}'"
         )
 
     async def start(self):
@@ -728,12 +728,11 @@ class Worker:
             return
 
         self._running = True
-        concurrency = self.semaphore._value
         self.logger.info(
-            f"Starting {concurrency} worker(s) for queue '{self.queue_name}'"
+            f"Starting {self.concurrency} worker(s) for queue '{self.queue_name}'"
         )
 
-        for i in range(concurrency):
+        for i in range(self.concurrency):
             monitor_task = asyncio.create_task(self._monitor_worker(i + 1))
             self._workers.append(monitor_task)
 
@@ -753,25 +752,31 @@ class Worker:
                 )
 
     async def _worker_loop(self, worker_id: int):
+        task = None
         while self._running:
             try:
-                # Dequeue outside semaphore to avoid blocking other workers
                 task = await self.task_queue.dequeue(queue_name=self.queue_name)
                 if task:
                     self.logger.info(
                         f"Worker {worker_id}: Dequeued task {task['id']} from queue '{self.queue_name}'"
                     )
-                    # Only acquire semaphore for task execution
-                    async with self.semaphore:
-                        await self.process_task(task, worker_id)
+                    await self.process_task(task, worker_id)
+                    task = None  # Task processed, clear reference
                 else:
-                    # Sleep outside semaphore - short sleep to be responsive
                     await asyncio.sleep(0.1)
             except asyncio.CancelledError:
                 self.logger.info(f"Worker {worker_id}: Received shutdown signal.")
+                # Return task to queue if it was dequeued but not processed
+                if task:
+                    try:
+                        await self.task_queue.requeue(task, queue_name=self.queue_name, apply_backoff=False)
+                        self.logger.info(f"Worker {worker_id}: Returned task {task['id']} to queue due to shutdown.")
+                    except Exception as e:
+                        self.logger.error(f"Worker {worker_id}: Failed to return task {task['id']} to queue: {e}")
                 break
             except Exception as e:
                 self.logger.exception(f"Worker {worker_id}: Error in worker loop: {e}")
+                task = None  # Clear task reference on error
                 await asyncio.sleep(1)
 
     async def stop(self, graceful: bool = True, timeout: int = 30):
@@ -1044,7 +1049,6 @@ class mTask:
         self.workers: Dict[str, Worker] = {}
         self.scheduled_tasks: List[ScheduledTask] = []
         self.retry_limit = retry_limit
-        self.semaphores: Dict[str, asyncio.Semaphore] = {}
         self.queue_status: Dict[str, str] = {}
         self.shutdown_timeout = shutdown_timeout
         self.enable_dlq = enable_dlq
@@ -1464,19 +1468,13 @@ class mTask:
             self.logger.exception(f"Failed to clear DLQ '{dlq_name}': {e}")
             return 0
 
-    def start_worker(
-        self,
-        queue_name: str,
-        semaphore: Optional[asyncio.Semaphore] = None,
-    ):
+    def start_worker(self, queue_name: str):
         if queue_name in self.workers:
             self.logger.warning(f"Worker for queue '{queue_name}' is already running.")
             return
 
         task_info = self.task_registry.get(queue_name, {})
         concurrency = task_info.get("concurrency", 1)
-        semaphore = semaphore if semaphore else asyncio.Semaphore(concurrency)
-        # Worker уже извлекает on_task_requeued в конструкторе по queue_name
 
         worker = Worker(
             task_queue=self.task_queue,
@@ -1484,7 +1482,7 @@ class mTask:
             task_registry_lock=self.task_registry_lock,
             retry_limit=self.retry_limit,
             queue_name=queue_name,
-            semaphore=semaphore,
+            concurrency=concurrency,
             logger=self.logger,
             enable_dlq=self.enable_dlq,
             move_to_dlq_callback=self._move_to_dlq,
@@ -1493,7 +1491,7 @@ class mTask:
         self.workers[queue_name] = worker
         asyncio.create_task(worker.start())
         self.logger.debug(
-            f"Started worker for queue '{queue_name}' with concurrency {semaphore._value}"
+            f"Started worker for queue '{queue_name}' with concurrency {concurrency}"
         )
 
     async def run_scheduled_tasks(self):
@@ -1519,11 +1517,7 @@ class mTask:
             await self.task_queue.recover_processing_tasks(queue_name)
 
         for queue_name in queue_names:
-            task_info = self.task_registry.get(queue_name, {})
-            concurrency = task_info.get("concurrency", 1)
-            semaphore = asyncio.Semaphore(concurrency)
-            self.semaphores[queue_name] = semaphore
-            self.start_worker(queue_name=queue_name, semaphore=semaphore)
+            self.start_worker(queue_name=queue_name)
 
         asyncio.create_task(self.run_scheduled_tasks())
 
@@ -1624,9 +1618,6 @@ class mTask:
                         f"Moved {len(tasks)} tasks from processing queue back to main queue '{queue_name}'."
                     )
 
-            if queue_name in self.semaphores:
-                del self.semaphores[queue_name]
-
             async with self.queue_status_lock:
                 self.queue_status[queue_name] = "Paused"
             self.logger.info(f"Queue '{queue_name}' paused for {duration} seconds.")
@@ -1657,12 +1648,7 @@ class mTask:
                         async with self.queue_status_lock:
                             self.queue_status[queue_name] = "Running"
                         self.logger.info(f"Queue '{queue_name}' is resumed.")
-                        async with self.task_registry_lock:
-                            task_info = self.task_registry.get(queue_name, {})
-                            concurrency = task_info.get("concurrency", 1)
-                        semaphore = asyncio.Semaphore(concurrency)
-                        self.semaphores[queue_name] = semaphore
-                        self.start_worker(queue_name, semaphore)
+                        self.start_worker(queue_name)
                     else:
                         pass
             await asyncio.sleep(5)
