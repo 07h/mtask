@@ -564,45 +564,76 @@ class TaskQueue:
             self.logger.exception(f"Failed to requeue task '{task['id']}': {e}")
             raise TaskRequeueError(f"Failed to requeue task '{task['id']}': {e}") from e
 
-    async def mark_completed(self, task_json: str, queue_name: str) -> None:
+    async def mark_completed(
+        self, 
+        task_json: str, 
+        queue_name: str,
+        max_retries: int = 3,
+        retry_delay: float = 1.0
+    ) -> None:
         """
         Mark a task as completed by removing it from the processing queue.
+        
+        Includes retry logic for timeout errors to handle connection pool contention.
         
         Args:
             task_json: The exact JSON string of the task (as stored in processing list)
             queue_name: Name of the queue
+            max_retries: Maximum number of retry attempts on timeout (default: 3)
+            retry_delay: Base delay between retries in seconds (default: 1.0)
         """
         processing_queue = f"{queue_name}:processing"
-        await self.ensure_connected()
+        
+        # Extract task_id for logging
         try:
-            # LREM removes element by value from List
-            # count=1 means remove first occurrence (from head)
-            deleted = await asyncio.wait_for(
-                self.redis.lrem(processing_queue, 1, task_json),
-                timeout=self.operation_timeout
-            )
-            if deleted:
-                # Extract task_id for logging
-                try:
-                    task = json.loads(task_json)
-                    task_id = task.get("id", "unknown")
-                except json.JSONDecodeError:
-                    task_id = "unknown"
-                self.logger.info(
-                    f"Task {task_id} marked as completed and removed from processing '{processing_queue}'."
+            task = json.loads(task_json)
+            task_id = task.get("id", "unknown")
+        except json.JSONDecodeError:
+            task_id = "unknown"
+        
+        last_error = None
+        for attempt in range(max_retries + 1):
+            try:
+                await self.ensure_connected()
+                # LREM removes element by value from List
+                # count=1 means remove first occurrence (from head)
+                deleted = await asyncio.wait_for(
+                    self.redis.lrem(processing_queue, 1, task_json),
+                    timeout=self.operation_timeout
                 )
-            else:
-                self.logger.warning(
-                    f"Task was not found in processing queue '{processing_queue}'."
-                )
-        except asyncio.TimeoutError:
-            self.logger.error(f"Mark completed operation timed out after {self.operation_timeout}s")
-            raise TaskProcessingError(f"Mark completed operation timed out after {self.operation_timeout}s")
-        except Exception as e:
-            self.logger.exception(f"Failed to mark task as completed: {e}")
-            raise TaskProcessingError(
-                f"Failed to mark task as completed: {e}"
-            ) from e
+                if deleted:
+                    self.logger.info(
+                        f"Task {task_id} marked as completed and removed from processing '{processing_queue}'."
+                    )
+                else:
+                    self.logger.warning(
+                        f"Task {task_id} was not found in processing queue '{processing_queue}'."
+                    )
+                return  # Success, exit
+                
+            except asyncio.TimeoutError as e:
+                last_error = e
+                if attempt < max_retries:
+                    delay = retry_delay * (2 ** attempt)  # Exponential backoff
+                    self.logger.warning(
+                        f"Mark completed timed out for task {task_id}, "
+                        f"retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries + 1})"
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    self.logger.error(
+                        f"Mark completed failed for task {task_id} after {max_retries + 1} attempts"
+                    )
+            except Exception as e:
+                self.logger.exception(f"Failed to mark task {task_id} as completed: {e}")
+                raise TaskProcessingError(
+                    f"Failed to mark task {task_id} as completed: {e}"
+                ) from e
+        
+        # All retries exhausted
+        raise TaskProcessingError(
+            f"Mark completed operation timed out for task {task_id} after {max_retries + 1} attempts"
+        )
 
     async def recover_processing_tasks(self, queue_name: str):
         """
