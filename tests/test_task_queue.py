@@ -45,11 +45,12 @@ async def test_dequeue_task(task_queue):
     assert task is not None
     assert task["id"] == task_id
     assert task["kwargs"] == {"key": "value"}
+    # Verify _task_json is set for mark_completed
+    assert "_task_json" in task
     
-    # Verify task moved to processing queue (now uses Hash)
-    processing_tasks = await task_queue.redis.hgetall("test_queue:processing")
-    assert len(processing_tasks) == 1
-    assert task_id in processing_tasks
+    # Verify task moved to processing queue (List format)
+    processing_count = await task_queue.redis.llen("test_queue:processing")
+    assert processing_count == 1
 
 
 @pytest.mark.asyncio
@@ -70,10 +71,11 @@ async def test_mark_completed(task_queue):
     task_id = await task_queue.enqueue(queue_name="test_queue", kwargs={"key": "value"})
     task = await task_queue.dequeue(queue_name="test_queue")
     
-    await task_queue.mark_completed(task_id, "test_queue")
+    # Use _task_json for mark_completed (LREM needs exact value)
+    await task_queue.mark_completed(task["_task_json"], "test_queue")
     
-    # Verify task removed from processing queue (now uses Hash)
-    processing_count = await task_queue.redis.hlen("test_queue:processing")
+    # Verify task removed from processing queue (List format)
+    processing_count = await task_queue.redis.llen("test_queue:processing")
     assert processing_count == 0
 
 
@@ -124,7 +126,7 @@ async def test_requeue_with_backoff(task_queue):
 
 @pytest.mark.asyncio
 async def test_recover_processing_tasks(task_queue):
-    """Test recovering tasks from processing queue (Hash format)."""
+    """Test recovering tasks from processing queue (List format)."""
     # Enqueue and dequeue tasks to populate processing queue
     task_ids = []
     for i in range(3):
@@ -132,9 +134,9 @@ async def test_recover_processing_tasks(task_queue):
         task_ids.append(task_id)
         await task_queue.dequeue(queue_name="test_queue")
     
-    # Verify 3 tasks in processing queue (now uses Hash)
-    processing_tasks = await task_queue.redis.hgetall("test_queue:processing")
-    assert len(processing_tasks) == 3
+    # Verify 3 tasks in processing queue (List format)
+    processing_count = await task_queue.redis.llen("test_queue:processing")
+    assert processing_count == 3
     
     # Recover tasks
     await task_queue.recover_processing_tasks("test_queue")
@@ -144,7 +146,7 @@ async def test_recover_processing_tasks(task_queue):
     assert len(main_queue_tasks) == 3
     
     # Verify processing queue is empty
-    processing_count = await task_queue.redis.hlen("test_queue:processing")
+    processing_count = await task_queue.redis.llen("test_queue:processing")
     assert processing_count == 0
 
 
@@ -162,9 +164,9 @@ async def test_task_size_validation(task_queue):
 
 
 @pytest.mark.asyncio
-async def test_recover_processing_tasks_list_migration(task_queue):
-    """Test recovering tasks from old List format processing queue (migration)."""
-    # Manually add tasks in old List format
+async def test_recover_processing_tasks_hash_migration(task_queue):
+    """Test recovering tasks from old Hash format processing queue (migration to List)."""
+    # Manually add tasks in old Hash format
     for i in range(3):
         task = {
             "id": f"task-{i}",
@@ -173,27 +175,27 @@ async def test_recover_processing_tasks_list_migration(task_queue):
             "status": "processing",
             "retry_count": 0,
         }
-        await task_queue.redis.rpush("test_queue:processing", json.dumps(task))
+        await task_queue.redis.hset("test_queue:processing", f"task-{i}", json.dumps(task))
     
-    # Verify 3 tasks in processing queue (List format)
+    # Verify 3 tasks in processing queue (Hash format)
     key_type = await task_queue.redis.type("test_queue:processing")
-    assert key_type == "list"
+    assert key_type == "hash"
     
-    # Recover tasks - should migrate from List to Hash
+    # Recover tasks - should migrate from Hash to List and then recover
     await task_queue.recover_processing_tasks("test_queue")
     
     # Verify tasks moved back to main queue
     main_queue_tasks = await task_queue.redis.lrange("test_queue", 0, -1)
     assert len(main_queue_tasks) == 3
     
-    # Verify processing queue is deleted
+    # Verify processing queue is empty (after rpoplpush loop)
     exists = await task_queue.redis.exists("test_queue:processing")
     assert exists == 0
 
 
 @pytest.mark.asyncio
-async def test_get_processing_task_count_hash(task_queue):
-    """Test getting processing task count with Hash format."""
+async def test_get_processing_task_count(task_queue):
+    """Test getting processing task count with List format."""
     # Enqueue and dequeue to create processing entries
     for i in range(2):
         await task_queue.enqueue(queue_name="test_queue", kwargs={"index": i})

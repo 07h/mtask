@@ -368,13 +368,19 @@ class TaskQueue:
             raise TaskEnqueueError(f"Failed to enqueue task: {e}") from e
 
     async def dequeue(self, queue_name: str = "default") -> Optional[Dict[str, Any]]:
+        """
+        Dequeue a task from the queue.
+        
+        Returns a task dict with '_task_json' field containing the JSON string
+        stored in processing queue (needed for mark_completed with LREM).
+        """
         await self.ensure_connected()
 
         processing_queue = f"{queue_name}:processing"
         priority_queue = f"{queue_name}:priority"
         
         try:
-            # Try priority queue first
+            # Try priority queue first (Sorted Set doesn't support LMOVE, so use zpopmax + rpush)
             priority_tasks = await asyncio.wait_for(
                 self.redis.zpopmax(priority_queue, 1),
                 timeout=self.operation_timeout
@@ -405,32 +411,58 @@ class TaskQueue:
                         # Backoff period expired, remove the marker
                         task.pop("retry_after", None)
                 
-                # Store in processing Hash (O(1) for mark_completed)
+                # Store in processing List (for priority tasks we can't use LMOVE)
                 final_task_json = task_json if "retry_after" not in task_json else json.dumps(task)
                 await asyncio.wait_for(
-                    self.redis.hset(processing_queue, task["id"], final_task_json),
+                    self.redis.rpush(processing_queue, final_task_json),
                     timeout=self.operation_timeout
                 )
+                # Store task_json for mark_completed (LREM needs exact value)
+                task["_task_json"] = final_task_json
                 self.logger.debug(
                     f"Dequeued priority task {task['id']} from queue '{queue_name}' to processing '{processing_queue}'"
                 )
                 return task
             
-            # Fall back to regular queue - try atomic LMOVE first (Redis 6.2+)
+            # Fall back to regular queue - use atomic LMOVE (Redis 6.2+)
             task_json = None
+            use_fallback = False
+            
             try:
                 # LMOVE atomically moves element from source to destination
-                # We move to a temp list first, then to hash
+                # LEFT = take from head of source, RIGHT = add to tail of destination
                 task_json = await asyncio.wait_for(
-                    self.redis.lpop(queue_name),
+                    self.redis.lmove(queue_name, processing_queue, "LEFT", "RIGHT"),
                     timeout=self.operation_timeout
                 )
-            except Exception:
-                # Fallback for older Redis or if lpop fails
-                pass
+            except Exception as e:
+                # Check if LMOVE is not supported (older Redis < 6.2)
+                error_msg = str(e).lower()
+                if "unknown command" in error_msg or "lmove" in error_msg:
+                    use_fallback = True
+                else:
+                    # Real error (timeout, network, etc.) - re-raise
+                    raise
+            
+            # Fallback for older Redis - use LPOP + RPUSH (non-atomic but preserves FIFO order)
+            # Note: RPOPLPUSH would change order (LIFO), so we avoid it
+            if use_fallback:
+                try:
+                    task_json = await asyncio.wait_for(
+                        self.redis.lpop(queue_name),
+                        timeout=self.operation_timeout
+                    )
+                    if task_json:
+                        await asyncio.wait_for(
+                            self.redis.rpush(processing_queue, task_json),
+                            timeout=self.operation_timeout
+                        )
+                except Exception:
+                    # If fallback fails, let it propagate
+                    raise
             
             if not task_json:
-                # No task available, short sleep to avoid busy loop
+                # No task available
                 return None
                 
             task = json.loads(task_json)
@@ -445,7 +477,11 @@ class TaskQueue:
                         f"Task {task['id']} still in backoff period, re-enqueueing "
                         f"(wait {wait_time:.1f}s more)"
                     )
-                    # Re-add to back of queue
+                    # Remove from processing and re-add to main queue
+                    await asyncio.wait_for(
+                        self.redis.lrem(processing_queue, 1, task_json),
+                        timeout=self.operation_timeout
+                    )
                     await asyncio.wait_for(
                         self.redis.rpush(queue_name, task_json),
                         timeout=self.operation_timeout
@@ -454,13 +490,20 @@ class TaskQueue:
                 else:
                     # Backoff period expired, remove the marker
                     task.pop("retry_after", None)
+                    # Update task in processing list with new JSON (without retry_after)
+                    new_task_json = json.dumps(task)
+                    await asyncio.wait_for(
+                        self.redis.lrem(processing_queue, 1, task_json),
+                        timeout=self.operation_timeout
+                    )
+                    await asyncio.wait_for(
+                        self.redis.rpush(processing_queue, new_task_json),
+                        timeout=self.operation_timeout
+                    )
+                    task_json = new_task_json
             
-            # Store in processing Hash (O(1) for mark_completed)
-            final_task_json = task_json if "retry_after" not in task_json else json.dumps(task)
-            await asyncio.wait_for(
-                self.redis.hset(processing_queue, task["id"], final_task_json),
-                timeout=self.operation_timeout
-            )
+            # Store task_json for mark_completed (LREM needs exact value)
+            task["_task_json"] = task_json
             self.logger.debug(
                 f"Dequeued task {task['id']} from queue '{queue_name}' to processing '{processing_queue}'"
             )
@@ -481,6 +524,8 @@ class TaskQueue:
 
         task["status"] = "pending"
         task.pop("start_time", None)
+        # Remove internal fields before serialization to avoid data growth
+        task.pop("_task_json", None)
         priority = task.get("priority", 0)
         
         # Store backoff timestamp in task instead of sleeping (to avoid task loss on crash)
@@ -519,34 +564,53 @@ class TaskQueue:
             self.logger.exception(f"Failed to requeue task '{task['id']}': {e}")
             raise TaskRequeueError(f"Failed to requeue task '{task['id']}': {e}") from e
 
-    async def mark_completed(self, task_id: str, queue_name: str) -> None:
+    async def mark_completed(self, task_json: str, queue_name: str) -> None:
+        """
+        Mark a task as completed by removing it from the processing queue.
+        
+        Args:
+            task_json: The exact JSON string of the task (as stored in processing list)
+            queue_name: Name of the queue
+        """
         processing_queue = f"{queue_name}:processing"
         await self.ensure_connected()
         try:
-            # O(1) operation using Hash instead of O(n) list scan
+            # LREM removes element by value from List
+            # count=1 means remove first occurrence (from head)
             deleted = await asyncio.wait_for(
-                self.redis.hdel(processing_queue, task_id),
+                self.redis.lrem(processing_queue, 1, task_json),
                 timeout=self.operation_timeout
             )
             if deleted:
+                # Extract task_id for logging
+                try:
+                    task = json.loads(task_json)
+                    task_id = task.get("id", "unknown")
+                except json.JSONDecodeError:
+                    task_id = "unknown"
                 self.logger.info(
                     f"Task {task_id} marked as completed and removed from processing '{processing_queue}'."
                 )
             else:
                 self.logger.warning(
-                    f"Task {task_id} was not found in processing queue '{processing_queue}'."
+                    f"Task was not found in processing queue '{processing_queue}'."
                 )
         except asyncio.TimeoutError:
             self.logger.error(f"Mark completed operation timed out after {self.operation_timeout}s")
             raise TaskProcessingError(f"Mark completed operation timed out after {self.operation_timeout}s")
         except Exception as e:
-            self.logger.exception(f"Failed to mark task {task_id} as completed: {e}")
+            self.logger.exception(f"Failed to mark task as completed: {e}")
             raise TaskProcessingError(
-                f"Failed to mark task {task_id} as completed: {e}"
+                f"Failed to mark task as completed: {e}"
             ) from e
 
-    async def recover_processing_tasks(self, queue_name: str, batch_size: int = 100):
-        """Recover tasks from processing queue (Hash) back to main queue using batches."""
+    async def recover_processing_tasks(self, queue_name: str):
+        """
+        Recover tasks from processing queue (List) back to main queue.
+        
+        This is called at startup to recover tasks that were left in processing
+        due to a crash or unexpected shutdown.
+        """
         await self.ensure_connected()
         processing_queue = f"{queue_name}:processing"
         main_queue = queue_name
@@ -560,54 +624,51 @@ class TaskQueue:
             if key_type == "none":
                 return
             
-            # Handle migration from old List format to new Hash format
-            if key_type == "list":
-                await self._migrate_processing_list_to_hash(queue_name)
-                key_type = "hash"
+            # Handle migration from old Hash format to new List format
+            if key_type == "hash":
+                await self._migrate_processing_hash_to_list(queue_name)
+                key_type = "list"
             
-            if key_type != "hash":
+            if key_type != "list":
                 self.logger.warning(
                     f"Processing queue '{processing_queue}' has unexpected type '{key_type}', skipping recovery"
                 )
                 return
             
-            # Get all tasks from Hash
-            tasks = await asyncio.wait_for(
-                self.redis.hgetall(processing_queue),
+            # Get count of tasks in processing
+            total_tasks = await asyncio.wait_for(
+                self.redis.llen(processing_queue),
                 timeout=self.operation_timeout
             )
             
-            if not tasks:
+            if total_tasks == 0:
                 return
             
-            total_tasks = len(tasks)
             recovered = 0
             
-            # Process in batches using pipeline
-            task_items = list(tasks.items())
-            for i in range(0, len(task_items), batch_size):
-                batch = task_items[i:i + batch_size]
-                
-                pipe = self.redis.pipeline()
-                for task_id, task_json in batch:
-                    pipe.lpush(main_queue, task_json)
-                await pipe.execute()
-                
-                recovered += len(batch)
-                
-                if recovered % 500 == 0 and recovered < total_tasks:
-                    self.logger.info(
-                        f"Recovery progress: {recovered}/{total_tasks} tasks moved from '{processing_queue}' to '{main_queue}'"
+            # Move all tasks from processing back to main queue using RPOPLPUSH
+            # This is atomic and preserves order
+            while True:
+                try:
+                    task_json = await asyncio.wait_for(
+                        self.redis.rpoplpush(processing_queue, main_queue),
+                        timeout=self.operation_timeout
                     )
+                    if not task_json:
+                        break
+                    recovered += 1
+                    
+                    if recovered % 500 == 0 and recovered < total_tasks:
+                        self.logger.info(
+                            f"Recovery progress: {recovered}/{total_tasks} tasks moved from '{processing_queue}' to '{main_queue}'"
+                        )
+                except Exception:
+                    break
             
-            # Delete processing hash after successful recovery
-            await asyncio.wait_for(
-                self.redis.delete(processing_queue),
-                timeout=self.operation_timeout
-            )
-            self.logger.info(
-                f"Recovered {recovered} tasks from processing '{processing_queue}' back to main '{main_queue}'."
-            )
+            if recovered > 0:
+                self.logger.info(
+                    f"Recovered {recovered} tasks from processing '{processing_queue}' back to main '{main_queue}'."
+                )
         except asyncio.TimeoutError:
             self.logger.error(f"Recovery operation timed out after {self.operation_timeout}s")
         except Exception as e:
@@ -615,15 +676,15 @@ class TaskQueue:
                 f"Failed to recover tasks from processing queue '{processing_queue}': {e}"
             )
     
-    async def _migrate_processing_list_to_hash(self, queue_name: str):
-        """Migrate processing queue from List to Hash format (one-time migration)."""
+    async def _migrate_processing_hash_to_list(self, queue_name: str):
+        """Migrate processing queue from Hash to List format (one-time migration)."""
         processing_queue = f"{queue_name}:processing"
-        self.logger.info(f"Migrating processing queue '{processing_queue}' from List to Hash format...")
+        self.logger.info(f"Migrating processing queue '{processing_queue}' from Hash to List format...")
         
         try:
-            # Get all tasks from List
+            # Get all tasks from Hash
             tasks = await asyncio.wait_for(
-                self.redis.lrange(processing_queue, 0, -1),
+                self.redis.hgetall(processing_queue),
                 timeout=self.operation_timeout
             )
             
@@ -631,20 +692,19 @@ class TaskQueue:
                 await self.redis.delete(processing_queue)
                 return
             
-            # Convert to Hash
-            temp_hash = f"{processing_queue}:migration_temp"
+            # Convert to List
+            temp_list = f"{processing_queue}:migration_temp"
             pipe = self.redis.pipeline()
-            for task_json in tasks:
-                task = json.loads(task_json)
-                pipe.hset(temp_hash, task["id"], task_json)
+            for task_id, task_json in tasks.items():
+                pipe.rpush(temp_list, task_json)
             await pipe.execute()
             
             # Atomic rename (delete old, rename temp)
             await self.redis.delete(processing_queue)
-            await self.redis.rename(temp_hash, processing_queue)
+            await self.redis.rename(temp_list, processing_queue)
             
             self.logger.info(
-                f"Successfully migrated {len(tasks)} tasks in '{processing_queue}' from List to Hash format."
+                f"Successfully migrated {len(tasks)} tasks in '{processing_queue}' from Hash to List format."
             )
         except Exception as e:
             self.logger.exception(f"Failed to migrate processing queue '{processing_queue}': {e}")
@@ -668,16 +728,14 @@ class TaskQueue:
         processing_queue = f"{queue_name}:processing"
         try:
             await self.ensure_connected()
-            # Use hlen for Hash (new format)
-            key_type = await self.redis.type(processing_queue)
-            if key_type == "hash":
-                count = await self.redis.hlen(processing_queue)
-            elif key_type == "list":
-                # Backward compatibility with old List format
-                count = await self.redis.llen(processing_queue)
-            else:
-                count = 0
+            count = await asyncio.wait_for(
+                self.redis.llen(processing_queue),
+                timeout=self.operation_timeout
+            )
             return count
+        except asyncio.TimeoutError:
+            self.logger.error(f"Get processing task count timed out after {self.operation_timeout}s")
+            return 0
         except Exception as e:
             self.logger.error(
                 f"Failed to get processing task count for '{queue_name}': {e}"
@@ -768,9 +826,19 @@ class Worker:
                 self.logger.info(f"Worker {worker_id}: Received shutdown signal.")
                 # Return task to queue if it was dequeued but not processed
                 if task:
+                    # Save _task_json before requeue (requeue removes it)
+                    task_json = task.get("_task_json")
                     try:
                         await self.task_queue.requeue(task, queue_name=self.queue_name, apply_backoff=False)
                         self.logger.info(f"Worker {worker_id}: Returned task {task['id']} to queue due to shutdown.")
+                        # Remove from processing queue to prevent duplicate execution after recovery
+                        if task_json:
+                            try:
+                                await self.task_queue.mark_completed(task_json, self.queue_name)
+                            except Exception as mc_err:
+                                self.logger.warning(
+                                    f"Worker {worker_id}: Failed to remove task from processing: {mc_err}"
+                                )
                     except Exception as e:
                         self.logger.error(f"Worker {worker_id}: Failed to return task {task['id']} to queue: {e}")
                 break
@@ -936,10 +1004,17 @@ class Worker:
         finally:
             self._active_tasks -= 1
             try:
-                await self.task_queue.mark_completed(task["id"], queue_name)
-                self.logger.info(
-                    f"Worker {worker_id}: Task {task['id']} marked as completed."
-                )
+                # Use _task_json stored by dequeue() for LREM
+                task_json = task.get("_task_json")
+                if task_json:
+                    await self.task_queue.mark_completed(task_json, queue_name)
+                    self.logger.info(
+                        f"Worker {worker_id}: Task {task['id']} marked as completed."
+                    )
+                else:
+                    self.logger.warning(
+                        f"Worker {worker_id}: Task {task['id']} missing _task_json, cannot mark completed."
+                    )
             except Exception as e:
                 self.logger.exception(
                     f"Worker {worker_id}: Failed to mark task {task['id']} as completed: {e}"
