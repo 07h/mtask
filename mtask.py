@@ -23,6 +23,7 @@ import random
 
 from croniter import croniter
 import redis.asyncio as redis
+from redis.exceptions import ConnectionError as RedisClientConnectionError
 from pydantic import BaseModel
 
 # ============================
@@ -624,6 +625,22 @@ class TaskQueue:
                     self.logger.error(
                         f"Mark completed failed for task {task_id} after {max_retries + 1} attempts"
                     )
+            except (RedisClientConnectionError, RedisConnectionError) as e:
+                self.logger.warning(
+                    "Mark completed connection error for task %s (attempt %s/%s): %s",
+                    task_id,
+                    attempt + 1,
+                    max_retries + 1,
+                    e,
+                )
+                self._connection_healthy = False
+                if attempt < max_retries:
+                    delay = retry_delay * (2 ** attempt)
+                    await asyncio.sleep(delay)
+                else:
+                    raise TaskProcessingError(
+                        f"Failed to mark task {task_id} as completed: {e}"
+                    ) from e
             except Exception as e:
                 self.logger.exception(f"Failed to mark task {task_id} as completed: {e}")
                 raise TaskProcessingError(
@@ -1046,6 +1063,19 @@ class Worker:
                 else:
                     self.logger.warning(
                         f"Worker {worker_id}: Task {task['id']} missing _task_json, cannot mark completed."
+                    )
+            except (TaskProcessingError, RedisClientConnectionError, RedisConnectionError) as e:
+                self.logger.exception(
+                    f"Worker {worker_id}: Failed to mark task {task['id']} as completed: {e}"
+                )
+                try:
+                    await self.task_queue.requeue(task, queue_name=self.queue_name, apply_backoff=False)
+                    self.logger.info(
+                        f"Worker {worker_id}: Task {task['id']} requeued after mark_completed failure (will be retried)."
+                    )
+                except Exception as req_e:
+                    self.logger.exception(
+                        f"Worker {worker_id}: Failed to requeue task {task['id']} after mark_completed failure: {req_e}"
                     )
             except Exception as e:
                 self.logger.exception(
@@ -1657,13 +1687,24 @@ class mTask:
             self.logger.error(f"Failed to start mTask: {e}")
             return
 
-        asyncio.create_task(self.monitor_queue_status())
+        self._monitor_task = asyncio.create_task(self.monitor_queue_status())
 
         self.logger.info("mTask is running. Press Ctrl+C to exit.")
 
         try:
             while True:
                 await asyncio.sleep(1)
+                if (
+                    self._monitor_task.done()
+                    and self._monitor_task.exception() is not None
+                    and not self._is_shutting_down
+                ):
+                    exc = self._monitor_task.exception()
+                    self.logger.warning(
+                        "Monitor queue status task exited with error, restarting: %s",
+                        exc,
+                    )
+                    self._monitor_task = asyncio.create_task(self.monitor_queue_status())
         except KeyboardInterrupt:
             self.logger.info("Received shutdown signal (Ctrl+C)...")
             await self.graceful_shutdown()
@@ -1734,28 +1775,46 @@ class mTask:
 
     async def monitor_queue_status(self):
         while True:
-            queue_names = list(self.task_registry.keys())
+            try:
+                await self.task_queue.ensure_connected()
+            except RedisConnectionError:
+                self.logger.warning("Monitor: Redis not connected, will retry after sleep.")
+                await asyncio.sleep(5)
+                continue
 
-            for queue_name in queue_names:
-                status_key = f"queue_status:{queue_name}"
-                current_status = (
-                    await self.task_queue.redis.get(status_key) or "Running"
+            try:
+                queue_names = list(self.task_registry.keys())
+
+                for queue_name in queue_names:
+                    status_key = f"queue_status:{queue_name}"
+                    current_status = (
+                        await self.task_queue.redis.get(status_key) or "Running"
+                    )
+                    previous_status = self.queue_status.get(queue_name, "Running")
+
+                    if current_status != previous_status:
+                        if current_status == "Paused":
+                            async with self.queue_status_lock:
+                                self.queue_status[queue_name] = "Paused"
+                            self.logger.info(f"Queue '{queue_name}' is paused.")
+                            if queue_name in self.workers:
+                                await self.workers[queue_name].stop()
+                                del self.workers[queue_name]
+                        elif current_status == "Running" or current_status is None:
+                            async with self.queue_status_lock:
+                                self.queue_status[queue_name] = "Running"
+                            self.logger.info(f"Queue '{queue_name}' is resumed.")
+                            self.start_worker(queue_name)
+                        else:
+                            pass
+            except (RedisClientConnectionError, RedisConnectionError) as e:
+                self.logger.warning(
+                    "Monitor: Redis connection error while checking queue status: %s. "
+                    "Will reconnect and retry.",
+                    e,
                 )
-                previous_status = self.queue_status.get(queue_name, "Running")
+                self.task_queue._connection_healthy = False
+                await asyncio.sleep(5)
+                continue
 
-                if current_status != previous_status:
-                    if current_status == "Paused":
-                        async with self.queue_status_lock:
-                            self.queue_status[queue_name] = "Paused"
-                        self.logger.info(f"Queue '{queue_name}' is paused.")
-                        if queue_name in self.workers:
-                            await self.workers[queue_name].stop()
-                            del self.workers[queue_name]
-                    elif current_status == "Running" or current_status is None:
-                        async with self.queue_status_lock:
-                            self.queue_status[queue_name] = "Running"
-                        self.logger.info(f"Queue '{queue_name}' is resumed.")
-                        self.start_worker(queue_name)
-                    else:
-                        pass
             await asyncio.sleep(5)
