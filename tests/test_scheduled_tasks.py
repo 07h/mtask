@@ -16,7 +16,11 @@ async def test_scheduled_task_interval():
     
     task = ScheduledTask(test_func, interval=1)
     
-    # Initially should be ready to run
+    # First run happens one interval after registration (not immediately)
+    assert task.should_run() is False
+    
+    # After the interval elapses, should be ready
+    await asyncio.sleep(1.1)
     assert task.should_run() is True
     
     # After running, should not be ready immediately

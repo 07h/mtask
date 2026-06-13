@@ -3,7 +3,7 @@ authors = ["Your Name <your.email@example.com>"]
 description = "μTask is a simple task queue and scheduler library using Redis and asyncio"
 license = "MIT"
 name = "mtask"
-version = "0.2.0"
+version = "0.3.0"
 
 [tool.poetry.dependencies]
 croniter = "^2.0.0,<3.0.0"
@@ -19,6 +19,8 @@ pytest = "^7.4.2"
 pytest-asyncio = "^0.21.1"
 pytest-env = "^1.1.1"
 fakeredis = "^2.20.0"
+# Lua scripting support for fakeredis (dequeue/promote scripts in tests)
+lupa = "^2.0"
 
 [build-system]
 build-backend = "poetry.core.masonry.api"

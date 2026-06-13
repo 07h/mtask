@@ -15,3 +15,31 @@ async def requeue_callback(task: Dict[str, Any], reason: str):
 async def first_checker(data: CheckerAuctionTask):
     pass
 ```
+
+## Deployment notes
+
+- **Single worker process per set of queues.** On startup the worker recovers
+  everything left in `{queue}:processing` back into the main queue. If two or
+  more worker processes consume the same queues, a restarting instance will
+  "steal" tasks that are currently being executed by its siblings, causing
+  duplicate execution. Producer-only processes (those that just call
+  `add_task()` / decorated wrappers and register no `@agent`) are always safe
+  in any number.
+- **uvloop is no longer enabled on import.** Since v0.3.0 the library does not
+  install the uvloop event loop policy as an import side effect. Enable it in
+  your application entrypoint if desired:
+
+  ```python
+  import sys, asyncio
+  if sys.platform != "win32":
+      try:
+          import uvloop
+          asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+      except ImportError:
+          pass
+  ```
+- **Delayed retries live in `{queue}:delayed`** (a sorted set scored by the
+  ready-at timestamp). When rolling back to a pre-0.3.0 version, drain this
+  key first — older versions do not read it.
+- **Delivery semantics are at-least-once.** A task may be re-executed after a
+  crash or forced shutdown; make handlers idempotent.

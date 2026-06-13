@@ -99,29 +99,124 @@ async def test_requeue_task(task_queue):
 
 @pytest.mark.asyncio
 async def test_requeue_with_backoff(task_queue):
-    """Test requeueing a task with backoff."""
-    import time
-    
+    """Test requeueing a task with backoff parks it in the delayed zset."""
     task_id = await task_queue.enqueue(queue_name="test_queue", kwargs={"key": "value"})
     task = await task_queue.dequeue(queue_name="test_queue")
     
     task["retry_count"] = 1
     await task_queue.requeue(task, queue_name="test_queue", apply_backoff=True)
     
-    # Task should be in queue
-    tasks = await task_queue.redis.lrange("test_queue", 0, -1)
-    assert len(tasks) == 1
+    # Task should be parked in the delayed zset, NOT in the main queue
+    delayed = await task_queue.redis.zrange("test_queue:delayed", 0, -1)
+    assert len(delayed) == 1
+    parked_task = json.loads(delayed[0])
+    assert parked_task["id"] == task_id
+    # Backoff is carried by the zset score, not by a field in the task body
+    assert "retry_after" not in parked_task
     
-    requeued_task = json.loads(tasks[0])
-    assert "retry_after" in requeued_task
+    main_queue = await task_queue.redis.lrange("test_queue", 0, -1)
+    assert len(main_queue) == 0
     
     # Try to dequeue immediately - should return None (still in backoff)
     task_dequeued = await task_queue.dequeue(queue_name="test_queue")
     assert task_dequeued is None
     
-    # Task should still be in queue
-    tasks = await task_queue.redis.lrange("test_queue", 0, -1)
-    assert len(tasks) == 1
+    # Task should still be parked in the delayed zset
+    delayed = await task_queue.redis.zrange("test_queue:delayed", 0, -1)
+    assert len(delayed) == 1
+
+
+@pytest.mark.asyncio
+async def test_backoff_does_not_block_other_tasks(task_queue):
+    """A task in backoff must not starve other ready tasks (C5 regression)."""
+    # Park a task in backoff
+    await task_queue.enqueue(queue_name="test_queue", kwargs={"key": "slow"})
+    backoff_task = await task_queue.dequeue(queue_name="test_queue")
+    backoff_task["retry_count"] = 3
+    await task_queue.requeue(backoff_task, queue_name="test_queue", apply_backoff=True)
+    await task_queue.mark_completed(backoff_task.get("_task_json") or "", "test_queue")
+    
+    # Enqueue a ready task
+    ready_id = await task_queue.enqueue(queue_name="test_queue", kwargs={"key": "fast"})
+    
+    # The ready task must be dequeued despite the parked backoff task
+    task = await task_queue.dequeue(queue_name="test_queue")
+    assert task is not None
+    assert task["id"] == ready_id
+
+
+@pytest.mark.asyncio
+async def test_delayed_task_promoted_after_backoff(task_queue):
+    """A parked task is promoted back to the queue once its backoff expires."""
+    task_id = await task_queue.enqueue(queue_name="test_queue", kwargs={"key": "value"})
+    task = await task_queue.dequeue(queue_name="test_queue")
+    await task_queue.mark_completed(task["_task_json"], "test_queue")
+    
+    # Park the task with an already-expired ready-at timestamp
+    import time as _time
+    task.pop("_task_json", None)
+    await task_queue.redis.zadd(
+        "test_queue:delayed", {json.dumps(task): _time.time() - 1}
+    )
+    
+    # Dequeue must promote and return it
+    dequeued = await task_queue.dequeue(queue_name="test_queue")
+    assert dequeued is not None
+    assert dequeued["id"] == task_id
+    
+    # Delayed zset is drained
+    delayed = await task_queue.redis.zrange("test_queue:delayed", 0, -1)
+    assert len(delayed) == 0
+
+
+@pytest.mark.asyncio
+async def test_legacy_retry_after_task_migrated_to_delayed(task_queue):
+    """Tasks written by older versions (retry_after in body) are migrated."""
+    import time as _time
+    legacy_task = {
+        "id": "legacy-1",
+        "name": "test_queue",
+        "kwargs": {},
+        "status": "pending",
+        "retry_count": 1,
+        "priority": 0,
+        "retry_after": _time.time() + 60,
+    }
+    await task_queue.redis.rpush("test_queue", json.dumps(legacy_task))
+    
+    # Dequeue filters it out and parks it in the delayed zset
+    task = await task_queue.dequeue(queue_name="test_queue")
+    assert task is None
+    
+    delayed = await task_queue.redis.zrange(
+        "test_queue:delayed", 0, -1, withscores=True
+    )
+    assert len(delayed) == 1
+    migrated, score = delayed[0]
+    assert json.loads(migrated)["id"] == "legacy-1"
+    assert score == pytest.approx(legacy_task["retry_after"], abs=1)
+    # Marker removed from the body; schedule lives in the zset score
+    assert "retry_after" not in json.loads(migrated)
+    
+    # Nothing left in main/processing queues
+    assert await task_queue.redis.llen("test_queue") == 0
+    assert await task_queue.redis.llen("test_queue:processing") == 0
+
+
+@pytest.mark.asyncio
+async def test_poison_message_moved_to_dlq(task_queue):
+    """Unparseable JSON in the queue goes to the DLQ, not an endless loop."""
+    await task_queue.redis.rpush("test_queue", "{not valid json")
+    good_id = await task_queue.enqueue(queue_name="test_queue", kwargs={"ok": 1})
+    
+    # Dequeue skips the poison entry and returns the good task
+    task = await task_queue.dequeue(queue_name="test_queue")
+    assert task is not None
+    assert task["id"] == good_id
+    
+    dlq = await task_queue.redis.lrange("test_queue:dlq", 0, -1)
+    assert dlq == ["{not valid json"]
+    assert await task_queue.redis.llen("test_queue:processing") == 1
 
 
 @pytest.mark.asyncio

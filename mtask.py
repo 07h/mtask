@@ -1,22 +1,15 @@
 # mTask.py
 
-import sys
 import asyncio
-
-# Use uvloop for better performance on Unix systems
-if sys.platform != 'win32':
-    try:
-        import uvloop
-        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    except ImportError:
-        pass
-
 import inspect
 import json
 import logging
+import signal
+import time
 import uuid
+from contextvars import ContextVar
 from functools import wraps
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Optional, List, Awaitable
 from enum import Enum
 import random
@@ -24,7 +17,16 @@ import random
 from croniter import croniter
 import redis.asyncio as redis
 from redis.exceptions import ConnectionError as RedisClientConnectionError
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
+
+# NOTE: mtask no longer installs the uvloop event loop policy on import.
+# Enable uvloop in your application entrypoint if desired (see example_usage.py).
+
+# Queue name of the task currently being processed in this asyncio context.
+# Used to detect pause_queue() calls made from inside a running task.
+_current_worker_queue: ContextVar[Optional[str]] = ContextVar(
+    "mtask_current_worker_queue", default=None
+)
 
 # ============================
 # Helper Functions
@@ -36,6 +38,55 @@ def calculate_backoff(retry_count: int, base_delay: int = 1, max_delay: int = 60
     delay = min(base_delay * (2 ** retry_count), max_delay)
     jitter = random.uniform(0, delay * 0.1)
     return delay + jitter
+
+
+# ============================
+# Lua Scripts
+# ============================
+
+# Atomically pop the highest-priority task from the priority zset and push it
+# into the processing list. Without this, a crash between ZPOPMAX and RPUSH
+# would lose the task forever (it exists only in process memory).
+PRIORITY_DEQUEUE_LUA = """
+local popped = redis.call('ZPOPMAX', KEYS[1], 1)
+if popped[1] == nil then
+    return false
+end
+redis.call('RPUSH', KEYS[2], popped[1])
+return popped[1]
+"""
+
+# Atomically move the head of the main list into the processing list.
+# Equivalent to LMOVE (Redis 6.2+) but works on any Redis with scripting.
+LIST_DEQUEUE_LUA = """
+local task = redis.call('LPOP', KEYS[1])
+if task == false then
+    return false
+end
+redis.call('RPUSH', KEYS[2], task)
+return task
+"""
+
+# Atomically move tasks whose backoff period has expired from the delayed
+# zset (score = ready-at timestamp) back into their target queue. Tasks with
+# priority > 0 go to the priority zset, the rest to the main list.
+PROMOTE_DELAYED_LUA = """
+local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[2]))
+for i, task_json in ipairs(due) do
+    redis.call('ZREM', KEYS[1], task_json)
+    local priority = 0
+    local ok, task = pcall(cjson.decode, task_json)
+    if ok and type(task) == 'table' and tonumber(task['priority']) then
+        priority = tonumber(task['priority'])
+    end
+    if priority > 0 then
+        redis.call('ZADD', KEYS[2], priority * 1000000 - tonumber(ARGV[1]), task_json)
+    else
+        redis.call('RPUSH', KEYS[3], task_json)
+    end
+end
+return #due
+"""
 
 
 # ============================
@@ -113,6 +164,11 @@ class TaskFunctionNotFoundError(mTaskError):
     pass
 
 
+# Deterministic failures that cannot succeed on retry: such tasks go
+# straight to the DLQ instead of being retried with backoff.
+NON_RETRYABLE_ERRORS = (ValidationError, TaskFunctionNotFoundError)
+
+
 # ============================
 # TaskQueue Class
 # ============================
@@ -144,14 +200,46 @@ class TaskQueue:
         self._connection_healthy = False
         self._health_check_task: Optional[asyncio.Task] = None
         self._reconnecting = False
-        self._connect_lock = asyncio.Lock()
+        self._reconnect_task: Optional[asyncio.Task] = None
+        # Lock is created lazily inside the running event loop
+        # (Python 3.8/3.9 bind asyncio.Lock to the loop at creation time)
+        self._connect_lock: Optional[asyncio.Lock] = None
+        # Lua scripts are (re-)registered lazily per Redis client instance
+        self._scripts_client: Optional[redis.Redis] = None
+        self._priority_dequeue_script = None
+        self._promote_delayed_script = None
+        self._list_dequeue_script = None
+
+    def _get_connect_lock(self) -> asyncio.Lock:
+        if self._connect_lock is None:
+            self._connect_lock = asyncio.Lock()
+        return self._connect_lock
+
+    def _ensure_scripts(self) -> None:
+        """(Re-)register Lua scripts when the Redis client changes.
+
+        register_script() is local (computes SHA only); the Script object
+        falls back to EVAL on NOSCRIPT, so this survives reconnects and
+        Redis restarts.
+        """
+        if self._scripts_client is not self.redis:
+            self._priority_dequeue_script = self.redis.register_script(
+                PRIORITY_DEQUEUE_LUA
+            )
+            self._promote_delayed_script = self.redis.register_script(
+                PROMOTE_DELAYED_LUA
+            )
+            self._list_dequeue_script = self.redis.register_script(
+                LIST_DEQUEUE_LUA
+            )
+            self._scripts_client = self.redis
 
     async def connect(self):
         # Avoid repeated connects/log spam if we're already connected.
         if self.redis is not None and self._connection_healthy:
             return
 
-        async with self._connect_lock:
+        async with self._get_connect_lock():
             # Re-check under lock
             if self.redis is not None and self._connection_healthy:
                 return
@@ -171,7 +259,9 @@ class TaskQueue:
                     max_connections=self.max_connections,
                     socket_timeout=self.operation_timeout,
                     socket_connect_timeout=self.connect_timeout,
-                    retry_on_timeout=True,
+                    # No client-level retries: mtask has its own retry logic,
+                    # and silent command retries can duplicate writes (RPUSH)
+                    retry_on_timeout=False,
                 )
                 await asyncio.wait_for(self.redis.ping(), timeout=self.connect_timeout)
                 self._connection_healthy = True
@@ -194,13 +284,14 @@ class TaskQueue:
                 raise RedisConnectionError(f"Failed to connect to Redis: {e}") from e
 
     async def disconnect(self):
-        # Stop health check
-        if self._health_check_task and not self._health_check_task.done():
-            self._health_check_task.cancel()
-            try:
-                await self._health_check_task
-            except asyncio.CancelledError:
-                pass
+        # Stop health check and any in-flight reconnect
+        for bg_task in (self._health_check_task, self._reconnect_task):
+            if bg_task and not bg_task.done():
+                bg_task.cancel()
+                try:
+                    await bg_task
+                except asyncio.CancelledError:
+                    pass
         
         if self.redis:
             await self.redis.close()
@@ -210,80 +301,102 @@ class TaskQueue:
     async def ensure_connected(self) -> None:
         """Ensure Redis client is initialized and responsive.
 
-        This prevents producer-side usage errors where enqueue() is called before connect(),
-        and also provides a safe fast-path during normal operation.
+        This prevents producer-side usage errors where enqueue() is called
+        before connect(), and provides a fast path during normal operation.
+
+        When the connection is unhealthy this method FAILS FAST: it kicks off
+        a single background reconnect (with backoff) and raises immediately
+        instead of blocking every caller behind the connect lock for the
+        whole reconnect cycle (which can take minutes).
         """
         # Fast path: client exists and marked healthy
         if self.redis is not None and self._connection_healthy:
             return
 
-        async with self._connect_lock:
-            # Re-check under lock
+        # No client yet: perform the initial connect (short, bounded by
+        # connect_timeout, so holding the lock here is fine)
+        if self.redis is None:
+            async with self._get_connect_lock():
+                if self.redis is None:
+                    await self.connect()
             if self.redis is not None and self._connection_healthy:
                 return
-
-            # If no client yet, do a normal connect
-            if self.redis is None:
-                await self.connect()
-                return
-
-            # Client exists but considered unhealthy -> try a ping, then reconnect if needed
-            try:
-                await asyncio.wait_for(self.redis.ping(), timeout=self.operation_timeout)
-                self._connection_healthy = True
-            except Exception:
-                self._connection_healthy = False
-                await self._reconnect()
-
-        # If reconnection failed, raise
-        if self.redis is None or not self._connection_healthy:
             raise RedisConnectionError("Redis is not connected.")
-    
+
+        # Client exists but marked unhealthy: try one quick ping
+        try:
+            await asyncio.wait_for(self.redis.ping(), timeout=self.operation_timeout)
+            self._connection_healthy = True
+            return
+        except Exception:
+            self._connection_healthy = False
+
+        # Fail fast for the caller; reconnect happens in the background
+        self._start_background_reconnect()
+        raise RedisConnectionError("Redis is not connected (reconnect in progress).")
+
+    def _start_background_reconnect(self) -> None:
+        """Start a single background reconnect task (idempotent)."""
+        if self._reconnecting:
+            return
+        if self._reconnect_task is not None and not self._reconnect_task.done():
+            return
+        self._reconnect_task = asyncio.create_task(self._reconnect())
+
     async def _reconnect(self):
-        """Attempt to reconnect to Redis with exponential backoff."""
+        """Attempt to reconnect to Redis with exponential backoff.
+
+        The first attempt happens immediately; backoff sleeps occur only
+        between failed attempts.
+        """
         if self._reconnecting:
             return
         
         self._reconnecting = True
-        attempt = 0
-        
-        while attempt < self.max_reconnect_attempts:
-            attempt += 1
-            wait_time = min(2 ** attempt, 60)  # Exponential backoff, max 60s
-            
-            self.logger.warning(
-                f"Attempting to reconnect to Redis (attempt {attempt}/{self.max_reconnect_attempts}) "
-                f"in {wait_time}s..."
-            )
-            await asyncio.sleep(wait_time)
-            
-            try:
-                if self.redis:
-                    await self.redis.close()
-                
-                self.redis = redis.from_url(
-                    self.redis_url,
-                    encoding="utf-8",
-                    decode_responses=True,
-                    max_connections=self.max_connections,
-                    socket_timeout=self.operation_timeout,
-                    socket_connect_timeout=self.connect_timeout,
-                    retry_on_timeout=True,
+        try:
+            attempt = 0
+            while attempt < self.max_reconnect_attempts:
+                attempt += 1
+                self.logger.warning(
+                    f"Attempting to reconnect to Redis "
+                    f"(attempt {attempt}/{self.max_reconnect_attempts})..."
                 )
-                await asyncio.wait_for(self.redis.ping(), timeout=self.connect_timeout)
-                self._connection_healthy = True
-                self.logger.info("Successfully reconnected to Redis")
-                self._reconnecting = False
-                return
-            except asyncio.TimeoutError:
-                self.logger.error(f"Reconnection attempt {attempt} timed out after {self.connect_timeout}s")
-            except Exception as e:
-                self.logger.error(f"Reconnection attempt {attempt} failed: {e}")
-        
-        self._reconnecting = False
-        self.logger.error(
-            f"Failed to reconnect to Redis after {self.max_reconnect_attempts} attempts"
-        )
+                try:
+                    if self.redis:
+                        await self.redis.close()
+
+                    self.redis = redis.from_url(
+                        self.redis_url,
+                        encoding="utf-8",
+                        decode_responses=True,
+                        max_connections=self.max_connections,
+                        socket_timeout=self.operation_timeout,
+                        socket_connect_timeout=self.connect_timeout,
+                        retry_on_timeout=False,
+                    )
+                    await asyncio.wait_for(self.redis.ping(), timeout=self.connect_timeout)
+                    self._connection_healthy = True
+                    self.logger.info("Successfully reconnected to Redis")
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except asyncio.TimeoutError:
+                    self.logger.error(
+                        f"Reconnection attempt {attempt} timed out after {self.connect_timeout}s"
+                    )
+                except Exception as e:
+                    self.logger.error(f"Reconnection attempt {attempt} failed: {e}")
+
+                if attempt < self.max_reconnect_attempts:
+                    wait_time = min(2 ** attempt, 60)  # Exponential backoff, max 60s
+                    self.logger.warning(f"Next reconnection attempt in {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+
+            self.logger.error(
+                f"Failed to reconnect to Redis after {self.max_reconnect_attempts} attempts"
+            )
+        finally:
+            self._reconnecting = False
     
     async def _health_check_loop(self):
         """Periodically check Redis connection health."""
@@ -306,16 +419,14 @@ class TaskQueue:
                     self._connection_healthy = False
                     self.logger.error(f"Redis health check timed out after {self.operation_timeout}s")
                 # Attempt to reconnect in background task to not block health check loop
-                if not self._reconnecting:
-                    asyncio.create_task(self._reconnect())
+                self._start_background_reconnect()
             except Exception as e:
                 if self._connection_healthy:
                     self._connection_healthy = False
                     self.logger.error(f"Redis health check failed: {e}")
                 
                 # Attempt to reconnect in background task to not block health check loop
-                if not self._reconnecting:
-                    asyncio.create_task(self._reconnect())
+                self._start_background_reconnect()
 
     async def enqueue(
         self,
@@ -335,8 +446,15 @@ class TaskQueue:
             "priority": priority,
         }
 
+        try:
+            task_json = json.dumps(task)
+        except (TypeError, ValueError) as e:
+            self.logger.error(f"Task kwargs are not JSON-serializable: {e}")
+            raise TaskEnqueueError(
+                f"Task kwargs are not JSON-serializable: {e}"
+            ) from e
+
         # Check task size
-        task_json = json.dumps(task)
         task_size = len(task_json.encode('utf-8'))
         if task_size > max_task_size:
             error_msg = f"Task size ({task_size} bytes) exceeds maximum allowed size ({max_task_size} bytes)"
@@ -347,7 +465,7 @@ class TaskQueue:
             if priority > 0:
                 # Use sorted set for priority queues (higher score = higher priority)
                 # Use negative timestamp as tiebreaker for same priority
-                score = priority * 1000000 - datetime.utcnow().timestamp()
+                score = priority * 1000000 - time.time()
                 await asyncio.wait_for(
                     self.redis.zadd(f"{queue_name}:priority", {task_json: score}),
                     timeout=self.operation_timeout
@@ -376,139 +494,67 @@ class TaskQueue:
         stored in processing queue (needed for mark_completed with LREM).
         """
         await self.ensure_connected()
+        self._ensure_scripts()
 
         processing_queue = f"{queue_name}:processing"
         priority_queue = f"{queue_name}:priority"
+        delayed_queue = f"{queue_name}:delayed"
         
         try:
-            # Try priority queue first (Sorted Set doesn't support LMOVE, so use zpopmax + rpush)
-            priority_tasks = await asyncio.wait_for(
-                self.redis.zpopmax(priority_queue, 1),
-                timeout=self.operation_timeout
+            # Move tasks whose backoff expired from the delayed zset back
+            # into the main/priority queues (atomic Lua script)
+            await asyncio.wait_for(
+                self._promote_delayed_script(
+                    keys=[delayed_queue, priority_queue, queue_name],
+                    args=[time.time(), 100],
+                ),
+                timeout=self.operation_timeout,
             )
-            if priority_tasks:
-                task_json, _ = priority_tasks[0]
-                task = json.loads(task_json)
-                
-                # Check if task has backoff delay (retry_after)
-                retry_after = task.get("retry_after")
-                if retry_after:
-                    current_time = datetime.utcnow().timestamp()
-                    if current_time < retry_after:
-                        # Task is in backoff period, re-enqueue with lower priority
-                        wait_time = retry_after - current_time
-                        self.logger.debug(
-                            f"Task {task['id']} still in backoff period, re-enqueueing "
-                            f"(wait {wait_time:.1f}s more)"
-                        )
-                        # Re-add with adjusted score to maintain order
-                        score = task.get("priority", 0) * 1000000 - retry_after
-                        await asyncio.wait_for(
-                            self.redis.zadd(priority_queue, {task_json: score}),
-                            timeout=self.operation_timeout
-                        )
-                        return None
-                    else:
-                        # Backoff period expired, remove the marker
-                        task.pop("retry_after", None)
-                
-                # Store in processing List (for priority tasks we can't use LMOVE)
-                final_task_json = task_json if "retry_after" not in task_json else json.dumps(task)
-                await asyncio.wait_for(
-                    self.redis.rpush(processing_queue, final_task_json),
-                    timeout=self.operation_timeout
+
+            # Try priority queue first: ZPOPMAX + RPUSH-to-processing is done
+            # atomically in Lua, so a crash cannot lose the task in between
+            task_json = await asyncio.wait_for(
+                self._priority_dequeue_script(
+                    keys=[priority_queue, processing_queue]
+                ),
+                timeout=self.operation_timeout,
+            )
+            if task_json:
+                task = await self._prepare_dequeued_task(
+                    task_json, queue_name, processing_queue, delayed_queue
                 )
-                # Store task_json for mark_completed (LREM needs exact value)
-                task["_task_json"] = final_task_json
-                self.logger.debug(
-                    f"Dequeued priority task {task['id']} from queue '{queue_name}' to processing '{processing_queue}'"
-                )
-                return task
-            
-            # Fall back to regular queue - use atomic LMOVE (Redis 6.2+)
-            task_json = None
-            use_fallback = False
-            
-            try:
-                # LMOVE atomically moves element from source to destination
-                # LEFT = take from head of source, RIGHT = add to tail of destination
-                task_json = await asyncio.wait_for(
-                    self.redis.lmove(queue_name, processing_queue, "LEFT", "RIGHT"),
-                    timeout=self.operation_timeout
-                )
-            except Exception as e:
-                # Check if LMOVE is not supported (older Redis < 6.2)
-                error_msg = str(e).lower()
-                if "unknown command" in error_msg or "lmove" in error_msg:
-                    use_fallback = True
-                else:
-                    # Real error (timeout, network, etc.) - re-raise
-                    raise
-            
-            # Fallback for older Redis - use LPOP + RPUSH (non-atomic but preserves FIFO order)
-            # Note: RPOPLPUSH would change order (LIFO), so we avoid it
-            if use_fallback:
-                try:
-                    task_json = await asyncio.wait_for(
-                        self.redis.lpop(queue_name),
-                        timeout=self.operation_timeout
-                    )
-                    if task_json:
-                        await asyncio.wait_for(
-                            self.redis.rpush(processing_queue, task_json),
-                            timeout=self.operation_timeout
-                        )
-                except Exception:
-                    # If fallback fails, let it propagate
-                    raise
-            
-            if not task_json:
-                # No task available
-                return None
-                
-            task = json.loads(task_json)
-            
-            # Check if task has backoff delay
-            retry_after = task.get("retry_after")
-            if retry_after:
-                current_time = datetime.utcnow().timestamp()
-                if current_time < retry_after:
-                    wait_time = retry_after - current_time
+                if task is not None:
                     self.logger.debug(
-                        f"Task {task['id']} still in backoff period, re-enqueueing "
-                        f"(wait {wait_time:.1f}s more)"
+                        f"Dequeued priority task {task['id']} from queue '{queue_name}' "
+                        f"to processing '{processing_queue}'"
                     )
-                    # Remove from processing and re-add to main queue
-                    await asyncio.wait_for(
-                        self.redis.lrem(processing_queue, 1, task_json),
-                        timeout=self.operation_timeout
-                    )
-                    await asyncio.wait_for(
-                        self.redis.rpush(queue_name, task_json),
-                        timeout=self.operation_timeout
-                    )
-                    return None
-                else:
-                    # Backoff period expired, remove the marker
-                    task.pop("retry_after", None)
-                    # Update task in processing list with new JSON (without retry_after)
-                    new_task_json = json.dumps(task)
-                    await asyncio.wait_for(
-                        self.redis.lrem(processing_queue, 1, task_json),
-                        timeout=self.operation_timeout
-                    )
-                    await asyncio.wait_for(
-                        self.redis.rpush(processing_queue, new_task_json),
-                        timeout=self.operation_timeout
-                    )
-                    task_json = new_task_json
+                    return task
+                # Poison message or legacy backoff task was filtered out:
+                # fall through to the regular queue so it is not starved
             
-            # Store task_json for mark_completed (LREM needs exact value)
-            task["_task_json"] = task_json
-            self.logger.debug(
-                f"Dequeued task {task['id']} from queue '{queue_name}' to processing '{processing_queue}'"
-            )
-            return task
+            # Regular queue: atomic LPOP+RPUSH via Lua (works on any Redis
+            # version, unlike LMOVE which needs 6.2+). Loop to skip over
+            # poison messages / legacy backoff entries without starving.
+            while True:
+                task_json = await asyncio.wait_for(
+                    self._list_dequeue_script(
+                        keys=[queue_name, processing_queue]
+                    ),
+                    timeout=self.operation_timeout
+                )
+                if not task_json:
+                    # No task available
+                    return None
+
+                task = await self._prepare_dequeued_task(
+                    task_json, queue_name, processing_queue, delayed_queue
+                )
+                if task is not None:
+                    self.logger.debug(
+                        f"Dequeued task {task['id']} from queue '{queue_name}' "
+                        f"to processing '{processing_queue}'"
+                    )
+                    return task
         except asyncio.TimeoutError:
             self.logger.error(f"Dequeue operation timed out after {self.operation_timeout}s")
             raise TaskDequeueError(f"Dequeue operation timed out after {self.operation_timeout}s")
@@ -520,6 +566,89 @@ class TaskQueue:
                 f"Failed to dequeue task from queue '{queue_name}': {e}"
             ) from e
 
+    async def _prepare_dequeued_task(
+        self,
+        task_json: str,
+        queue_name: str,
+        processing_queue: str,
+        delayed_queue: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Validate a task that was just moved into the processing list.
+
+        Returns the parsed task dict (with "_task_json" set for later LREM),
+        or None when the entry was filtered out:
+        - unparseable JSON (poison message) is moved to the DLQ instead of
+          cycling through processing/recovery forever;
+        - legacy tasks carrying a future "retry_after" field (written by
+          older mtask versions) are migrated into the delayed zset.
+        """
+        try:
+            task = json.loads(task_json)
+        except (json.JSONDecodeError, ValueError):
+            self.logger.error(
+                f"Unparseable task in queue '{queue_name}', moving to DLQ: {task_json[:200]!r}"
+            )
+            await asyncio.wait_for(
+                self.redis.lrem(processing_queue, 1, task_json),
+                timeout=self.operation_timeout
+            )
+            await asyncio.wait_for(
+                self.redis.rpush(f"{queue_name}:dlq", task_json),
+                timeout=self.operation_timeout
+            )
+            return None
+
+        # Legacy backoff format: "retry_after" stored in the task body
+        retry_after = task.get("retry_after") if isinstance(task, dict) else None
+        if retry_after:
+            if time.time() < retry_after:
+                # Still in backoff: migrate to the delayed zset
+                self.logger.debug(
+                    f"Task {task.get('id')} still in backoff "
+                    f"(legacy retry_after), moving to delayed zset"
+                )
+                task.pop("retry_after", None)
+                migrated_json = json.dumps(task)
+                await asyncio.wait_for(
+                    self.redis.lrem(processing_queue, 1, task_json),
+                    timeout=self.operation_timeout
+                )
+                await asyncio.wait_for(
+                    self.redis.zadd(delayed_queue, {migrated_json: retry_after}),
+                    timeout=self.operation_timeout
+                )
+                return None
+            # Backoff expired: strip the marker and refresh the processing entry
+            task.pop("retry_after", None)
+            new_task_json = json.dumps(task)
+            await asyncio.wait_for(
+                self.redis.lrem(processing_queue, 1, task_json),
+                timeout=self.operation_timeout
+            )
+            await asyncio.wait_for(
+                self.redis.rpush(processing_queue, new_task_json),
+                timeout=self.operation_timeout
+            )
+            task_json = new_task_json
+
+        if not isinstance(task, dict) or "id" not in task:
+            self.logger.error(
+                f"Malformed task in queue '{queue_name}', moving to DLQ: {task_json[:200]!r}"
+            )
+            await asyncio.wait_for(
+                self.redis.lrem(processing_queue, 1, task_json),
+                timeout=self.operation_timeout
+            )
+            await asyncio.wait_for(
+                self.redis.rpush(f"{queue_name}:dlq", task_json),
+                timeout=self.operation_timeout
+            )
+            return None
+
+        # Store task_json for mark_completed (LREM needs exact value)
+        task["_task_json"] = task_json
+        return task
+
     async def requeue(self, task: Dict[str, Any], queue_name: str = "default", apply_backoff: bool = True) -> None:
         await self.ensure_connected()
 
@@ -527,23 +656,33 @@ class TaskQueue:
         task.pop("start_time", None)
         # Remove internal fields before serialization to avoid data growth
         task.pop("_task_json", None)
+        # Legacy backoff marker (older mtask versions): backoff is now
+        # scheduled via the delayed zset, not stored in the task body
+        task.pop("retry_after", None)
         priority = task.get("priority", 0)
         
-        # Store backoff timestamp in task instead of sleeping (to avoid task loss on crash)
-        if apply_backoff and task.get("retry_count", 0) > 0:
-            backoff_delay = calculate_backoff(task["retry_count"])
-            task["retry_after"] = datetime.utcnow().timestamp() + backoff_delay
-            self.logger.debug(
-                f"Task {task['id']} will be retried after {backoff_delay:.2f}s backoff "
-                f"(at timestamp {task['retry_after']})"
-            )
-        
         try:
-            if priority > 0:
-                # Re-enqueue to priority queue
-                score = priority * 1000000 - datetime.utcnow().timestamp()
+            task_json = json.dumps(task)
+
+            if apply_backoff and task.get("retry_count", 0) > 0:
+                # Park the task in the delayed zset until the backoff expires.
+                # It is promoted back to its queue by dequeue() (Lua script),
+                # so it neither blocks the queue nor gets shuffled around.
+                backoff_delay = calculate_backoff(task["retry_count"])
+                retry_at = time.time() + backoff_delay
                 await asyncio.wait_for(
-                    self.redis.zadd(f"{queue_name}:priority", {json.dumps(task): score}),
+                    self.redis.zadd(f"{queue_name}:delayed", {task_json: retry_at}),
+                    timeout=self.operation_timeout
+                )
+                self.logger.debug(
+                    f"Task {task['id']} parked in delayed queue for {backoff_delay:.2f}s "
+                    f"(retry {task['retry_count']}, ready at {retry_at})"
+                )
+            elif priority > 0:
+                # Re-enqueue to priority queue
+                score = priority * 1000000 - time.time()
+                await asyncio.wait_for(
+                    self.redis.zadd(f"{queue_name}:priority", {task_json: score}),
                     timeout=self.operation_timeout
                 )
                 self.logger.debug(
@@ -552,7 +691,7 @@ class TaskQueue:
             else:
                 # Re-enqueue to regular queue
                 await asyncio.wait_for(
-                    self.redis.rpush(queue_name, json.dumps(task)),
+                    self.redis.rpush(queue_name, task_json),
                     timeout=self.operation_timeout
                 )
                 self.logger.debug(
@@ -849,6 +988,12 @@ class Worker:
                 await worker_task
             except asyncio.CancelledError:
                 self.logger.info(f"Worker {worker_id}: Received shutdown signal.")
+                # Cancelling this monitor does NOT cancel the inner Task —
+                # propagate the cancellation explicitly so the worker loop
+                # actually stops and can requeue its in-flight task.
+                if not worker_task.done():
+                    worker_task.cancel()
+                    await asyncio.gather(worker_task, return_exceptions=True)
                 break
             except Exception as e:
                 self.logger.exception(f"Worker {worker_id}: Unexpected error: {e}")
@@ -859,6 +1004,7 @@ class Worker:
 
     async def _worker_loop(self, worker_id: int):
         task = None
+        idle_sleep = 0.1
         while self._running:
             try:
                 task = await self.task_queue.dequeue(queue_name=self.queue_name)
@@ -866,10 +1012,17 @@ class Worker:
                     self.logger.info(
                         f"Worker {worker_id}: Dequeued task {task['id']} from queue '{self.queue_name}'"
                     )
-                    await self.process_task(task, worker_id)
-                    task = None  # Task processed, clear reference
+                    # Transfer ownership: process_task handles requeue/cleanup
+                    # itself (including on cancellation), so the CancelledError
+                    # branch below must not requeue it a second time.
+                    current_task, task = task, None
+                    await self.process_task(current_task, worker_id)
+                    idle_sleep = 0.1
                 else:
-                    await asyncio.sleep(0.1)
+                    # Adaptive idle backoff: poll fast when busy, ease off
+                    # to 1s on an empty queue to reduce Redis load
+                    await asyncio.sleep(idle_sleep)
+                    idle_sleep = min(idle_sleep * 2, 1.0)
             except asyncio.CancelledError:
                 self.logger.info(f"Worker {worker_id}: Received shutdown signal.")
                 # Return task to queue if it was dequeued but not processed
@@ -905,10 +1058,10 @@ class Worker:
         
         if graceful and self._active_tasks > 0:
             self.logger.info(f"Gracefully stopping workers, waiting for {self._active_tasks} active tasks...")
-            start_time = datetime.utcnow().timestamp()
+            start_time = time.monotonic()
             
             while self._active_tasks > 0:
-                elapsed = datetime.utcnow().timestamp() - start_time
+                elapsed = time.monotonic() - start_time
                 if elapsed >= timeout:
                     self.logger.warning(
                         f"Graceful shutdown timeout reached after {timeout}s, "
@@ -929,6 +1082,13 @@ class Worker:
         queue_name = task["name"]
         kwargs = task.get("kwargs", {})
         self._active_tasks += 1
+        # Save the exact JSON stored in the processing list BEFORE any
+        # requeue() call: requeue() pops "_task_json" from the task dict,
+        # and the finally block below needs it for LREM cleanup.
+        task_json = task.get("_task_json")
+        # Mark this asyncio context as "inside a worker task" so that
+        # pause_queue() can detect re-entrant calls (see mTask.pause_queue).
+        ctx_token = _current_worker_queue.set(self.queue_name)
         
         try:
             # Read without lock - task_registry is immutable after startup
@@ -945,33 +1105,35 @@ class Worker:
                 )
     
             # Execute the task
-            task["start_time"] = datetime.utcnow().timestamp()
+            task["start_time"] = time.time()
             self.logger.info(
                 f"Worker {worker_id}: Executing task {task['id']} from queue '{queue_name}'"
             )
 
             sig = inspect.signature(func)
-            expects_model = False
-            model_class: Optional[BaseModel] = None
+            model_param_name: Optional[str] = None
+            model_class: Optional[type] = None
             for name, param in sig.parameters.items():
                 if (
                     param.annotation
                     and inspect.isclass(param.annotation)
                     and issubclass(param.annotation, BaseModel)
                 ):
-                    expects_model = True
+                    model_param_name = name
                     model_class = param.annotation
                     break
 
-            if expects_model and model_class:
+            if model_param_name and model_class:
                 data_model = model_class(**kwargs)
                 self.logger.info(
                     f"Worker {worker_id}: Executing task {task['id']} - '{queue_name}' with data={data_model}"
                 )
+                # Pass the model using the actual parameter name from the signature
+                call_kwargs = {model_param_name: data_model}
                 if timeout:
-                    await asyncio.wait_for(func(data=data_model), timeout=timeout)
+                    await asyncio.wait_for(func(**call_kwargs), timeout=timeout)
                 else:
-                    await func(data=data_model)
+                    await func(**call_kwargs)
             else:
                 self.logger.info(
                     f"Worker {worker_id}: Executing task {task['id']} - '{queue_name}' with kwargs={kwargs}"
@@ -982,7 +1144,7 @@ class Worker:
                     await func(**kwargs)
 
             # Record successful completion metrics
-            execution_time = datetime.utcnow().timestamp() - task["start_time"]
+            execution_time = time.time() - task["start_time"]
             if self.record_metric_callback:
                 await self.record_metric_callback(self.queue_name, "completed")
                 await self.record_metric_callback(self.queue_name, "execution_time", execution_time)
@@ -990,6 +1152,36 @@ class Worker:
             self.logger.info(
                 f"Worker {worker_id}: Task {task['id']} completed successfully in {execution_time:.2f}s."
             )
+        except asyncio.CancelledError:
+            # Worker is being cancelled mid-execution (shutdown/pause):
+            # return the task to the queue for redelivery, then re-raise.
+            # The finally block removes the old processing entry.
+            self.logger.info(
+                f"Worker {worker_id}: Task {task['id']} cancelled mid-execution, requeueing."
+            )
+            try:
+                await self.task_queue.requeue(
+                    task, queue_name=self.queue_name, apply_backoff=False
+                )
+            except Exception as req_e:
+                self.logger.error(
+                    f"Worker {worker_id}: Failed to requeue cancelled task {task['id']}: {req_e} "
+                    f"(it will be recovered from the processing queue on next startup)"
+                )
+                # Keep the processing entry so recovery can pick it up
+                task_json = None
+            raise
+        except NON_RETRYABLE_ERRORS as e:
+            # Deterministic failures (validation, missing handler):
+            # retrying cannot succeed, move straight to DLQ.
+            error_msg = f"Non-retryable error: {e}"
+            self.logger.error(
+                f"Worker {worker_id}: Task {task['id']} failed with non-retryable error: {e}"
+            )
+            if self.record_metric_callback:
+                await self.record_metric_callback(self.queue_name, "failed")
+            if self.enable_dlq and self.move_to_dlq_callback:
+                await self.move_to_dlq_callback(task, self.queue_name, error_msg)
         except asyncio.TimeoutError:
             self.logger.error(
                 f"Worker {worker_id}: Task {task['id']} exceeded timeout of {timeout} seconds."
@@ -1050,36 +1242,25 @@ class Worker:
                 if self.enable_dlq and self.move_to_dlq_callback:
                     await self.move_to_dlq_callback(task, self.queue_name, error_msg)
         finally:
+            _current_worker_queue.reset(ctx_token)
             self._active_tasks -= 1
             try:
-                # Use _task_json stored by dequeue() for LREM
+                # Use the task_json saved BEFORE any requeue() call (requeue
+                # pops "_task_json" from the dict), so the old processing
+                # entry is removed even after a retry was scheduled.
                 # Note: use self.queue_name (worker's queue), not queue_name (task's name)
-                task_json = task.get("_task_json")
                 if task_json:
                     await self.task_queue.mark_completed(task_json, self.queue_name)
                     self.logger.info(
-                        f"Worker {worker_id}: Task {task['id']} marked as completed."
-                    )
-                else:
-                    self.logger.warning(
-                        f"Worker {worker_id}: Task {task['id']} missing _task_json, cannot mark completed."
-                    )
-            except (TaskProcessingError, RedisClientConnectionError, RedisConnectionError) as e:
-                self.logger.exception(
-                    f"Worker {worker_id}: Failed to mark task {task['id']} as completed: {e}"
-                )
-                try:
-                    await self.task_queue.requeue(task, queue_name=self.queue_name, apply_backoff=False)
-                    self.logger.info(
-                        f"Worker {worker_id}: Task {task['id']} requeued after mark_completed failure (will be retried)."
-                    )
-                except Exception as req_e:
-                    self.logger.exception(
-                        f"Worker {worker_id}: Failed to requeue task {task['id']} after mark_completed failure: {req_e}"
+                        f"Worker {worker_id}: Task {task['id']} removed from processing queue."
                     )
             except Exception as e:
+                # Do NOT requeue here: the task either completed successfully,
+                # was already requeued for retry, or sits in the DLQ. A stale
+                # processing entry is recovered (at most once) on next startup,
+                # which is preferable to actively creating a duplicate now.
                 self.logger.exception(
-                    f"Worker {worker_id}: Failed to mark task {task['id']} as completed: {e}"
+                    f"Worker {worker_id}: Failed to remove task {task['id']} from processing queue: {e}"
                 )
 
 
@@ -1118,13 +1299,16 @@ class ScheduledTask:
         if self.is_running:
             return
         self.is_running = True
+        # Schedule the next run from the TRIGGER time, not from completion:
+        # otherwise a 50s task with interval=60 effectively runs every ~110s
+        # (interval drift). Overlap is still prevented by is_running.
+        self.last_run = datetime.now()
+        self.next_run = self._get_next_run()
         try:
             await self.func()
         except Exception as e:
             self.logger.exception(f"Error in scheduled task {self.func.__name__}: {e}")
         finally:
-            self.last_run = datetime.now()
-            self.next_run = self._get_next_run()
             self.is_running = False
 
     def should_run(self) -> bool:
@@ -1194,10 +1378,18 @@ class mTask:
         self._metrics: Dict[str, Dict[str, Any]] = {}
         self._initialize_metrics()
 
-        # Use only asyncio locks to avoid race conditions
-        self.task_registry_lock = asyncio.Lock()
-        self.queue_status_lock = asyncio.Lock()
-        self.metrics_lock = asyncio.Lock()
+        # Internal service tasks and references to fire-and-forget tasks
+        # (keeping references prevents GC and lets us observe exceptions)
+        self._monitor_task: Optional[asyncio.Task] = None
+        self._scheduler_task: Optional[asyncio.Task] = None
+        self._background_tasks: set = set()
+
+        # Locks are created lazily inside the running event loop:
+        # on Python 3.8/3.9 asyncio.Lock() binds to the loop at creation
+        # time, which breaks when mTask is instantiated at module level.
+        self._task_registry_lock: Optional[asyncio.Lock] = None
+        self._queue_status_lock: Optional[asyncio.Lock] = None
+        self._metrics_lock: Optional[asyncio.Lock] = None
 
         self.logger = logging.getLogger("mTask")
         if enable_logging:
@@ -1215,6 +1407,44 @@ class mTask:
         self.logger.debug("Initialized mTask instance.")
         self._initialize_status_report_task()
 
+    @property
+    def task_registry_lock(self) -> asyncio.Lock:
+        if self._task_registry_lock is None:
+            self._task_registry_lock = asyncio.Lock()
+        return self._task_registry_lock
+
+    @property
+    def queue_status_lock(self) -> asyncio.Lock:
+        if self._queue_status_lock is None:
+            self._queue_status_lock = asyncio.Lock()
+        return self._queue_status_lock
+
+    @property
+    def metrics_lock(self) -> asyncio.Lock:
+        if self._metrics_lock is None:
+            self._metrics_lock = asyncio.Lock()
+        return self._metrics_lock
+
+    def _spawn_background(self, coro: Awaitable, name: str) -> asyncio.Task:
+        """Create a background task, keep a reference and log its failure.
+
+        asyncio only keeps weak references to tasks: without storing a
+        reference a fire-and-forget task can be garbage collected mid-flight
+        and its exception silently dropped.
+        """
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+
+        def _on_done(t: asyncio.Task) -> None:
+            self._background_tasks.discard(t)
+            if not t.cancelled() and t.exception() is not None:
+                self.logger.error(
+                    "Background task '%s' failed: %r", name, t.exception()
+                )
+
+        task.add_done_callback(_on_done)
+        return task
+
     def _initialize_metrics(self):
         """Initialize metrics structure for all queues."""
         # Metrics will be populated lazily as queues are used
@@ -1230,7 +1460,7 @@ class mTask:
                     "tasks_requeued": 0,
                     "total_execution_time": 0.0,
                     "task_count": 0,
-                    "last_updated": datetime.utcnow().isoformat(),
+                    "last_updated": datetime.now(timezone.utc).isoformat(),
                 }
             
             if metric_type == "completed":
@@ -1243,7 +1473,7 @@ class mTask:
                 self._metrics[queue_name]["total_execution_time"] += value
                 self._metrics[queue_name]["task_count"] += 1
             
-            self._metrics[queue_name]["last_updated"] = datetime.utcnow().isoformat()
+            self._metrics[queue_name]["last_updated"] = datetime.now(timezone.utc).isoformat()
     
     async def get_metrics(self, queue_name: Optional[str] = None) -> Dict[str, Any]:
         """Get metrics for a specific queue or all queues."""
@@ -1352,7 +1582,10 @@ class mTask:
             concurrency (int, optional): Max concurrency.
             timeout (int, optional): Timeout in seconds.
             on_task_requeued (Callable, optional): Callback called when task is requeued (e.g. due to timeout).
-            rate_limit (int, optional): Max tasks per minute (None for unlimited).
+            rate_limit (int, optional): Max task ENQUEUES per minute via the
+                decorated wrapper (None for unlimited). Note: this limits the
+                producer side, not worker execution rate, and does not apply
+                to add_task().
         """
         # Validate parameters
         if concurrency <= 0:
@@ -1365,6 +1598,25 @@ class mTask:
             raise ValueError("queue_name must be a non-empty string")
 
         def decorator(func: Callable):
+            # Fail fast on signatures the worker cannot call
+            if not inspect.iscoroutinefunction(func):
+                raise ValueError(
+                    f"Task function '{func.__name__}' for queue '{queue_name}' "
+                    f"must be an async function"
+                )
+            for param_name, param in inspect.signature(func).parameters.items():
+                if (
+                    param.annotation
+                    and inspect.isclass(param.annotation)
+                    and issubclass(param.annotation, BaseModel)
+                    and param.kind == inspect.Parameter.POSITIONAL_ONLY
+                ):
+                    raise ValueError(
+                        f"Model parameter '{param_name}' of task function "
+                        f"'{func.__name__}' must be addressable by keyword "
+                        f"(it is positional-only)"
+                    )
+
             # Registration happens at startup, no concurrency issues
             self.task_registry[queue_name] = {
                 "func": func,
@@ -1379,24 +1631,32 @@ class mTask:
             async def wrapper(*args, **kwargs):
                 # Check rate limit if configured
                 if rate_limit:
-                    current_minute = int(datetime.utcnow().timestamp() / 60)
+                    current_minute = int(time.time() / 60)
                     rate_key = f"rate_limit:{queue_name}:{current_minute}"
                     
                     try:
-                        current_count = await self.task_queue.redis.get(rate_key)
-                        current_count = int(current_count) if current_count else 0
+                        await self.task_queue.ensure_connected()
+                        # INCR is atomic, so concurrent producers cannot
+                        # slip past the limit (no GET-then-INCR race)
+                        current_count = await asyncio.wait_for(
+                            self.task_queue.redis.incr(rate_key),
+                            timeout=self.task_queue.operation_timeout,
+                        )
+                        if current_count == 1:
+                            # Fresh counter: set expiry (key is per-minute,
+                            # 2 min TTL covers clock skew)
+                            await asyncio.wait_for(
+                                self.task_queue.redis.expire(rate_key, 120),
+                                timeout=self.task_queue.operation_timeout,
+                            )
                         
-                        if current_count >= rate_limit:
+                        if current_count > rate_limit:
                             self.logger.warning(
                                 f"Rate limit exceeded for queue '{queue_name}': {current_count}/{rate_limit} per minute"
                             )
                             raise mTaskError(
                                 f"Rate limit exceeded for queue '{queue_name}': {current_count}/{rate_limit} per minute"
                             )
-                        
-                        # Increment counter with 2 minute expiry
-                        await self.task_queue.redis.incr(rate_key)
-                        await self.task_queue.redis.expire(rate_key, 120)
                     except Exception as e:
                         if isinstance(e, mTaskError):
                             raise
@@ -1540,12 +1800,21 @@ class mTask:
             return
         
         dlq_name = f"{queue_name}:dlq"
+        # Strip internal fields: "_task_json" contains a full JSON copy of
+        # the task and would double the DLQ entry size (and grow
+        # exponentially across DLQ retry cycles)
+        task.pop('_task_json', None)
+        task.pop('start_time', None)
         task['error'] = error
-        task['failed_at'] = datetime.utcnow().isoformat()
+        task['failed_at'] = datetime.now(timezone.utc).isoformat()
         task['status'] = 'failed'
         
         try:
-            await self.task_queue.redis.rpush(dlq_name, json.dumps(task))
+            await self.task_queue.ensure_connected()
+            await asyncio.wait_for(
+                self.task_queue.redis.rpush(dlq_name, json.dumps(task)),
+                timeout=self.task_queue.operation_timeout,
+            )
             self.logger.error(
                 f"Task {task['id']} moved to DLQ '{dlq_name}' after {self.retry_limit} retries. Error: {error}"
             )
@@ -1556,8 +1825,18 @@ class mTask:
         """Get all tasks from the Dead Letter Queue for a specific queue."""
         dlq_name = f"{queue_name}:dlq"
         try:
-            tasks_json = await self.task_queue.redis.lrange(dlq_name, 0, -1)
-            tasks = [json.loads(task_json) for task_json in tasks_json]
+            await self.task_queue.ensure_connected()
+            tasks_json = await asyncio.wait_for(
+                self.task_queue.redis.lrange(dlq_name, 0, -1),
+                timeout=self.task_queue.operation_timeout,
+            )
+            tasks = []
+            for task_json in tasks_json:
+                try:
+                    tasks.append(json.loads(task_json))
+                except (json.JSONDecodeError, ValueError):
+                    # Poison messages land in the DLQ as raw strings
+                    tasks.append({"id": None, "raw": task_json, "status": "failed"})
             return tasks
         except Exception as e:
             self.logger.exception(f"Failed to get DLQ tasks from '{dlq_name}': {e}")
@@ -1567,22 +1846,37 @@ class mTask:
         """Retry a task from the Dead Letter Queue by re-enqueueing it."""
         dlq_name = f"{queue_name}:dlq"
         try:
-            tasks_json = await self.task_queue.redis.lrange(dlq_name, 0, -1)
+            await self.task_queue.ensure_connected()
+            tasks_json = await asyncio.wait_for(
+                self.task_queue.redis.lrange(dlq_name, 0, -1),
+                timeout=self.task_queue.operation_timeout,
+            )
             for index, task_json in enumerate(tasks_json):
-                task = json.loads(task_json)
-                if task['id'] == task_id:
+                try:
+                    task = json.loads(task_json)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if isinstance(task, dict) and task.get('id') == task_id:
                     # Remove from DLQ
-                    await self.task_queue.redis.lrem(dlq_name, 0, task_json)
+                    await asyncio.wait_for(
+                        self.task_queue.redis.lrem(dlq_name, 0, task_json),
+                        timeout=self.task_queue.operation_timeout,
+                    )
                     
-                    # Reset task for retry
+                    # Reset task for retry and strip internal/stale fields
                     task['retry_count'] = 0
                     task['status'] = 'pending'
                     task.pop('error', None)
                     task.pop('failed_at', None)
                     task.pop('start_time', None)
+                    task.pop('_task_json', None)
+                    task.pop('retry_after', None)
                     
                     # Re-enqueue
-                    await self.task_queue.redis.rpush(queue_name, json.dumps(task))
+                    await asyncio.wait_for(
+                        self.task_queue.redis.rpush(queue_name, json.dumps(task)),
+                        timeout=self.task_queue.operation_timeout,
+                    )
                     self.logger.info(f"Task {task_id} moved from DLQ back to queue '{queue_name}'")
                     return True
             
@@ -1596,9 +1890,16 @@ class mTask:
         """Clear all tasks from the Dead Letter Queue for a specific queue."""
         dlq_name = f"{queue_name}:dlq"
         try:
-            count = await self.task_queue.redis.llen(dlq_name)
+            await self.task_queue.ensure_connected()
+            count = await asyncio.wait_for(
+                self.task_queue.redis.llen(dlq_name),
+                timeout=self.task_queue.operation_timeout,
+            )
             if count > 0:
-                await self.task_queue.redis.delete(dlq_name)
+                await asyncio.wait_for(
+                    self.task_queue.redis.delete(dlq_name),
+                    timeout=self.task_queue.operation_timeout,
+                )
                 self.logger.info(f"Cleared {count} tasks from DLQ '{dlq_name}'")
             return count
         except Exception as e:
@@ -1626,7 +1927,7 @@ class mTask:
             record_metric_callback=self._record_metric,
         )
         self.workers[queue_name] = worker
-        asyncio.create_task(worker.start())
+        self._spawn_background(worker.start(), f"worker-start:{queue_name}")
         self.logger.debug(
             f"Started worker for queue '{queue_name}' with concurrency {concurrency}"
         )
@@ -1635,7 +1936,9 @@ class mTask:
         while True:
             for task in self.scheduled_tasks:
                 if task.should_run():
-                    asyncio.create_task(task.run())
+                    self._spawn_background(
+                        task.run(), f"scheduled:{task.func.__name__}"
+                    )
             await asyncio.sleep(1)
 
     async def connect_and_start_workers(self):
@@ -1656,7 +1959,7 @@ class mTask:
         for queue_name in queue_names:
             self.start_worker(queue_name=queue_name)
 
-        asyncio.create_task(self.run_scheduled_tasks())
+        self._scheduler_task = asyncio.create_task(self.run_scheduled_tasks())
 
     async def graceful_shutdown(self):
         """Perform graceful shutdown of all workers and disconnect from Redis."""
@@ -1666,10 +1969,23 @@ class mTask:
         
         self._is_shutting_down = True
         self.logger.info("Starting graceful shutdown...")
-        
-        # Stop all workers with timeout
+
+        # Stop internal service tasks first so they don't react to the
+        # workers/queues being torn down.
+        for service_task in (self._monitor_task, self._scheduler_task):
+            if service_task is not None and not service_task.done():
+                service_task.cancel()
+        for service_task in (self._monitor_task, self._scheduler_task):
+            if service_task is not None:
+                try:
+                    await asyncio.gather(service_task, return_exceptions=True)
+                except asyncio.CancelledError:
+                    pass
+
+        # Stop all workers with timeout (iterate over a copy: pause_queue /
+        # monitor_queue_status may mutate self.workers concurrently)
         shutdown_tasks = []
-        for queue_name, worker in self.workers.items():
+        for queue_name, worker in list(self.workers.items()):
             self.logger.info(f"Stopping worker for queue '{queue_name}'...")
             shutdown_tasks.append(worker.stop(graceful=True, timeout=self.shutdown_timeout))
         
@@ -1689,33 +2005,92 @@ class mTask:
 
         self._monitor_task = asyncio.create_task(self.monitor_queue_status())
 
+        # Register signal handlers so SIGINT/SIGTERM trigger a real graceful
+        # shutdown. Note: "except KeyboardInterrupt" inside a coroutine almost
+        # never fires (asyncio delivers CancelledError instead), so signals
+        # and CancelledError are the actual shutdown paths.
+        shutdown_event = asyncio.Event()
+        loop = asyncio.get_event_loop()
+        registered_signals: List[Any] = []
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, shutdown_event.set)
+                registered_signals.append(sig)
+            except (NotImplementedError, RuntimeError):
+                # Windows / non-main thread: signals not supported here
+                pass
+
         self.logger.info("mTask is running. Press Ctrl+C to exit.")
 
         try:
-            while True:
-                await asyncio.sleep(1)
-                if (
-                    self._monitor_task.done()
-                    and self._monitor_task.exception() is not None
-                    and not self._is_shutting_down
-                ):
-                    exc = self._monitor_task.exception()
-                    self.logger.warning(
-                        "Monitor queue status task exited with error, restarting: %s",
-                        exc,
-                    )
-                    self._monitor_task = asyncio.create_task(self.monitor_queue_status())
+            while not shutdown_event.is_set():
+                try:
+                    await asyncio.wait_for(shutdown_event.wait(), timeout=1)
+                except asyncio.TimeoutError:
+                    pass
+                self._restart_failed_service_tasks()
+            self.logger.info("Received shutdown signal...")
+            await self.graceful_shutdown()
+        except asyncio.CancelledError:
+            # run() task was cancelled (e.g. asyncio.run teardown or
+            # manager_task.cancel() in the host application)
+            self.logger.info("Received cancellation, shutting down gracefully...")
+            await self.graceful_shutdown()
+            raise
         except KeyboardInterrupt:
             self.logger.info("Received shutdown signal (Ctrl+C)...")
             await self.graceful_shutdown()
         except Exception as e:
             self.logger.exception(f"Unexpected error: {e}")
             await self.graceful_shutdown()
+        finally:
+            for sig in registered_signals:
+                try:
+                    loop.remove_signal_handler(sig)
+                except (NotImplementedError, RuntimeError):
+                    pass
+
+    def _restart_failed_service_tasks(self) -> None:
+        """Restart internal service tasks (monitor, scheduler) if they died."""
+        if self._is_shutting_down:
+            return
+
+        if (
+            self._monitor_task is not None
+            and self._monitor_task.done()
+            and not self._monitor_task.cancelled()
+            and self._monitor_task.exception() is not None
+        ):
+            self.logger.warning(
+                "Monitor queue status task exited with error, restarting: %s",
+                self._monitor_task.exception(),
+            )
+            self._monitor_task = asyncio.create_task(self.monitor_queue_status())
+
+        if (
+            self._scheduler_task is not None
+            and self._scheduler_task.done()
+            and not self._scheduler_task.cancelled()
+            and self._scheduler_task.exception() is not None
+        ):
+            self.logger.warning(
+                "Scheduled tasks runner exited with error, restarting: %s",
+                self._scheduler_task.exception(),
+            )
+            self._scheduler_task = asyncio.create_task(self.run_scheduled_tasks())
 
     async def _get_queue_status(self, queue_name: str) -> str:
         status_key = f"queue_status:{queue_name}"
-        status = await self.task_queue.redis.get(status_key) or "Running"
-        return status
+        try:
+            await self.task_queue.ensure_connected()
+            status = await asyncio.wait_for(
+                self.task_queue.redis.get(status_key),
+                timeout=self.task_queue.operation_timeout,
+            )
+            return status or "Running"
+        except Exception as e:
+            self.logger.error(f"Failed to get status for queue '{queue_name}': {e}")
+            return "Unknown"
 
     async def pause_queue(self, queue_name: str, duration: int):
         # Validate parameters
@@ -1730,47 +2105,61 @@ class mTask:
 
         status_key = f"queue_status:{queue_name}"
         try:
-            current_status = await self.task_queue.redis.get(status_key) or "Running"
+            await self.task_queue.ensure_connected()
+            current_status = await asyncio.wait_for(
+                self.task_queue.redis.get(status_key),
+                timeout=self.task_queue.operation_timeout,
+            ) or "Running"
             if current_status == "Paused":
                 self.logger.warning(f"Queue '{queue_name}' is already paused.")
                 return
 
-            await self.task_queue.redis.set(status_key, "Paused", ex=duration)
+            await asyncio.wait_for(
+                self.task_queue.redis.set(status_key, "Paused", ex=duration),
+                timeout=self.task_queue.operation_timeout,
+            )
+        except mTaskError:
+            raise
+        except Exception as e:
+            self.logger.exception(f"Failed to pause queue '{queue_name}': {e}")
+            raise mTaskError(f"Failed to pause queue '{queue_name}': {e}") from e
 
-            await self.workers[queue_name].stop()
-            del self.workers[queue_name]
+        # Detect a re-entrant call: pause_queue() invoked from INSIDE a task
+        # of the very worker we are about to stop. A synchronous graceful
+        # stop would wait for the calling task itself (self-deadlock until
+        # the shutdown timeout), so finalize the pause in a background task
+        # instead — the caller can finish, then the worker stops cleanly.
+        if _current_worker_queue.get() == queue_name:
+            self.logger.info(
+                f"pause_queue('{queue_name}') called from inside a task of the same "
+                f"queue; finishing the pause in the background."
+            )
+            self._spawn_background(
+                self._finalize_pause(queue_name, duration),
+                f"pause-queue:{queue_name}",
+            )
+            return
 
-            # Move tasks from processing queue back to main queue
-            processing_queue = f"{queue_name}:processing"
-            key_type = await self.task_queue.redis.type(processing_queue)
-            
-            if key_type == "hash":
-                # New Hash format
-                tasks = await self.task_queue.redis.hgetall(processing_queue)
-                if tasks:
-                    pipe = self.task_queue.redis.pipeline()
-                    for task_id, task_json in tasks.items():
-                        pipe.lpush(queue_name, task_json)
-                    await pipe.execute()
-                    await self.task_queue.redis.delete(processing_queue)
-                    self.logger.info(
-                        f"Moved {len(tasks)} tasks from processing queue back to main queue '{queue_name}'."
-                    )
-            elif key_type == "list":
-                # Old List format (backward compatibility)
-                tasks = await self.task_queue.redis.lrange(processing_queue, 0, -1)
-                if tasks:
-                    await self.task_queue.redis.lpush(queue_name, *tasks[::-1])
-                    await self.task_queue.redis.delete(processing_queue)
-                    self.logger.info(
-                        f"Moved {len(tasks)} tasks from processing queue back to main queue '{queue_name}'."
-                    )
+        await self._finalize_pause(queue_name, duration)
+
+    async def _finalize_pause(self, queue_name: str, duration: int):
+        """Stop the worker for a paused queue and return its in-flight tasks."""
+        try:
+            worker = self.workers.pop(queue_name, None)
+            if worker is not None:
+                await worker.stop(graceful=True, timeout=self.shutdown_timeout)
+
+            # Return tasks from the processing queue back to the main queue.
+            # recover_processing_tasks uses an atomic RPOPLPUSH loop (and
+            # handles the legacy Hash format), unlike the previous
+            # LRANGE+LPUSH+DELETE which could drop concurrently added tasks.
+            await self.task_queue.recover_processing_tasks(queue_name)
 
             async with self.queue_status_lock:
                 self.queue_status[queue_name] = "Paused"
             self.logger.info(f"Queue '{queue_name}' paused for {duration} seconds.")
         except Exception as e:
-            self.logger.exception(f"Failed to pause queue '{queue_name}': {e}")
+            self.logger.exception(f"Failed to finalize pause of queue '{queue_name}': {e}")
             raise mTaskError(f"Failed to pause queue '{queue_name}': {e}") from e
 
     async def monitor_queue_status(self):
@@ -1797,9 +2186,18 @@ class mTask:
                             async with self.queue_status_lock:
                                 self.queue_status[queue_name] = "Paused"
                             self.logger.info(f"Queue '{queue_name}' is paused.")
-                            if queue_name in self.workers:
-                                await self.workers[queue_name].stop()
-                                del self.workers[queue_name]
+                            # pop() avoids a KeyError race with pause_queue /
+                            # _finalize_pause removing the worker concurrently
+                            worker = self.workers.pop(queue_name, None)
+                            if worker is not None:
+                                await worker.stop(
+                                    graceful=True, timeout=self.shutdown_timeout
+                                )
+                                # Return in-flight tasks so they are not stuck
+                                # in processing for the whole pause duration
+                                await self.task_queue.recover_processing_tasks(
+                                    queue_name
+                                )
                         elif current_status == "Running" or current_status is None:
                             async with self.queue_status_lock:
                                 self.queue_status[queue_name] = "Running"
