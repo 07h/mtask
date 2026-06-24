@@ -155,9 +155,13 @@ async def test_delayed_task_promoted_after_backoff(task_queue):
     # Park the task with an already-expired ready-at timestamp
     import time as _time
     task.pop("_task_json", None)
+    task.pop("_delivery_attempts", None)
     await task_queue.redis.zadd(
         "test_queue:delayed", {json.dumps(task): _time.time() - 1}
     )
+    
+    # Reset the promote throttle (V6) so this back-to-back dequeue promotes
+    task_queue._last_promote.clear()
     
     # Dequeue must promote and return it
     dequeued = await task_queue.dequeue(queue_name="test_queue")

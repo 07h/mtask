@@ -40,6 +40,25 @@ def calculate_backoff(retry_count: int, base_delay: int = 1, max_delay: int = 60
     return delay + jitter
 
 
+# Optional faster JSON via orjson (V9). Falls back to stdlib json when not
+# installed. Safe for LREM matching: we always store and later compare the
+# exact same string, so cross-process formatting differences do not matter.
+try:
+    import orjson as _orjson
+
+    def _dumps(obj: Any) -> str:
+        return _orjson.dumps(obj).decode("utf-8")
+
+    def _loads(s: Any) -> Any:
+        return _orjson.loads(s)
+except ImportError:  # pragma: no cover - depends on environment
+    def _dumps(obj: Any) -> str:
+        return json.dumps(obj)
+
+    def _loads(s: Any) -> Any:
+        return json.loads(s)
+
+
 # ============================
 # Lua Scripts
 # ============================
@@ -209,6 +228,10 @@ class TaskQueue:
         self._priority_dequeue_script = None
         self._promote_delayed_script = None
         self._list_dequeue_script = None
+        # V6: throttle the delayed-promote script so it does not run on every
+        # poll of every worker. Maps queue_name -> last promote monotonic ts.
+        self._last_promote: Dict[str, float] = {}
+        self._promote_interval: float = 0.5
 
     def _get_connect_lock(self) -> asyncio.Lock:
         if self._connect_lock is None:
@@ -447,7 +470,7 @@ class TaskQueue:
         }
 
         try:
-            task_json = json.dumps(task)
+            task_json = _dumps(task)
         except (TypeError, ValueError) as e:
             self.logger.error(f"Task kwargs are not JSON-serializable: {e}")
             raise TaskEnqueueError(
@@ -502,14 +525,20 @@ class TaskQueue:
         
         try:
             # Move tasks whose backoff expired from the delayed zset back
-            # into the main/priority queues (atomic Lua script)
-            await asyncio.wait_for(
-                self._promote_delayed_script(
-                    keys=[delayed_queue, priority_queue, queue_name],
-                    args=[time.time(), 100],
-                ),
-                timeout=self.operation_timeout,
-            )
+            # into the main/priority queues (atomic Lua script). Throttled
+            # per queue (V6) so N concurrent workers do not each run this on
+            # every poll; correctness is unaffected since a slightly delayed
+            # promotion only postpones a retry by < _promote_interval.
+            now = time.monotonic()
+            if now - self._last_promote.get(queue_name, 0.0) >= self._promote_interval:
+                self._last_promote[queue_name] = now
+                await asyncio.wait_for(
+                    self._promote_delayed_script(
+                        keys=[delayed_queue, priority_queue, queue_name],
+                        args=[time.time(), 100],
+                    ),
+                    timeout=self.operation_timeout,
+                )
 
             # Try priority queue first: ZPOPMAX + RPUSH-to-processing is done
             # atomically in Lua, so a crash cannot lose the task in between
@@ -583,7 +612,7 @@ class TaskQueue:
           older mtask versions) are migrated into the delayed zset.
         """
         try:
-            task = json.loads(task_json)
+            task = _loads(task_json)
         except (json.JSONDecodeError, ValueError):
             self.logger.error(
                 f"Unparseable task in queue '{queue_name}', moving to DLQ: {task_json[:200]!r}"
@@ -608,7 +637,7 @@ class TaskQueue:
                     f"(legacy retry_after), moving to delayed zset"
                 )
                 task.pop("retry_after", None)
-                migrated_json = json.dumps(task)
+                migrated_json = _dumps(task)
                 await asyncio.wait_for(
                     self.redis.lrem(processing_queue, 1, task_json),
                     timeout=self.operation_timeout
@@ -620,7 +649,7 @@ class TaskQueue:
                 return None
             # Backoff expired: strip the marker and refresh the processing entry
             task.pop("retry_after", None)
-            new_task_json = json.dumps(task)
+            new_task_json = _dumps(task)
             await asyncio.wait_for(
                 self.redis.lrem(processing_queue, 1, task_json),
                 timeout=self.operation_timeout
@@ -645,9 +674,41 @@ class TaskQueue:
             )
             return None
 
+        # Crash-loop protection (V1): bump the per-task delivery counter in
+        # Redis. It is stored OUTSIDE the task body (a hash) so it survives a
+        # process crash and does not require rewriting the processing entry.
+        try:
+            attempts = await asyncio.wait_for(
+                self.redis.hincrby(f"{queue_name}:attempts", task["id"], 1),
+                timeout=self.operation_timeout,
+            )
+            task["_delivery_attempts"] = attempts
+        except Exception as e:
+            # Counter is best-effort; never block delivery on it
+            self.logger.warning(
+                f"Failed to track delivery attempts for task {task.get('id')}: {e}"
+            )
+
         # Store task_json for mark_completed (LREM needs exact value)
         task["_task_json"] = task_json
         return task
+
+    async def clear_delivery_attempts(self, queue_name: str, task_id: str) -> None:
+        """Drop the delivery counter for a task that reached a terminal state.
+
+        Called on success / DLQ / non-retryable so the {queue}:attempts hash
+        does not accumulate stale entries (V1).
+        """
+        try:
+            await self.ensure_connected()
+            await asyncio.wait_for(
+                self.redis.hdel(f"{queue_name}:attempts", task_id),
+                timeout=self.operation_timeout,
+            )
+        except Exception as e:
+            self.logger.debug(
+                f"Failed to clear delivery attempts for task {task_id}: {e}"
+            )
 
     async def requeue(self, task: Dict[str, Any], queue_name: str = "default", apply_backoff: bool = True) -> None:
         await self.ensure_connected()
@@ -656,13 +717,15 @@ class TaskQueue:
         task.pop("start_time", None)
         # Remove internal fields before serialization to avoid data growth
         task.pop("_task_json", None)
+        # Delivery counter lives in Redis ({queue}:attempts), not in the body
+        task.pop("_delivery_attempts", None)
         # Legacy backoff marker (older mtask versions): backoff is now
         # scheduled via the delayed zset, not stored in the task body
         task.pop("retry_after", None)
         priority = task.get("priority", 0)
         
         try:
-            task_json = json.dumps(task)
+            task_json = _dumps(task)
 
             if apply_backoff and task.get("retry_count", 0) > 0:
                 # Park the task in the delayed zset until the backoff expires.
@@ -726,9 +789,9 @@ class TaskQueue:
         
         # Extract task_id for logging
         try:
-            task = json.loads(task_json)
+            task = _loads(task_json)
             task_id = task.get("id", "unknown")
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, ValueError):
             task_id = "unknown"
         
         last_error = None
@@ -962,10 +1025,37 @@ class Worker:
         self.enable_dlq = enable_dlq
         self.move_to_dlq_callback = move_to_dlq_callback
         self.record_metric_callback = record_metric_callback
+        # Grace period after a timeout cancellation before the slot is freed
+        # regardless of whether the coroutine honoured the cancel (V3).
+        self.cancel_grace_period: float = 1.0
+        # Strong references so detached/background tasks are not GC'd (V3/V7)
+        self._detached_tasks: set = set()
+        self._bg_tasks: set = set()
 
         self.logger.debug(
             f"Worker initialized with concurrency={concurrency} for queue '{queue_name}'"
         )
+
+    def _spawn_callback(self, callback: Optional[Callable], task: Dict[str, Any], reason: str) -> None:
+        """Run an on_task_requeued callback off the worker hot path (V7).
+
+        A slow or hanging callback must not hold the concurrency slot, so it
+        runs as a tracked background task with exceptions logged.
+        """
+        if callback is None:
+            return
+
+        cb_task = asyncio.ensure_future(callback(task, reason))
+        self._bg_tasks.add(cb_task)
+
+        def _on_done(t: asyncio.Task) -> None:
+            self._bg_tasks.discard(t)
+            if not t.cancelled() and t.exception() is not None:
+                self.logger.error(
+                    "on_task_requeued callback failed: %r", t.exception()
+                )
+
+        cb_task.add_done_callback(_on_done)
 
     async def start(self):
         if self._running:
@@ -1078,6 +1168,42 @@ class Worker:
         self._workers.clear()
         self.logger.info("Workers stopped.")
 
+    async def _run_with_timeout(self, coro: Awaitable, timeout: Optional[float]):
+        """Run a coroutine, enforcing a timeout that frees the worker slot.
+
+        Unlike asyncio.wait_for, which waits indefinitely for an
+        uncooperative coroutine to finish cancelling, this method cancels the
+        task, waits only a short grace period, and then returns control even
+        if the task ignored the cancellation. The still-running coroutine is
+        detached (a strong reference is kept so it is not garbage-collected)
+        and raises asyncio.TimeoutError to the caller. This guarantees the
+        concurrency slot is released on timeout (V3).
+        """
+        if not timeout:
+            await coro
+            return
+
+        coro_task = asyncio.ensure_future(coro)
+        done, _ = await asyncio.wait({coro_task}, timeout=timeout)
+        if coro_task in done:
+            # Propagate result/exception
+            coro_task.result()
+            return
+
+        coro_task.cancel()
+        # Give the task a short window to honour the cancellation
+        await asyncio.wait({coro_task}, timeout=self.cancel_grace_period)
+        if not coro_task.done():
+            self.logger.warning(
+                "Task did not stop within %.1fs grace after timeout; "
+                "detaching it so the worker slot is freed (it may keep "
+                "running in the background).",
+                self.cancel_grace_period,
+            )
+            self._detached_tasks.add(coro_task)
+            coro_task.add_done_callback(self._detached_tasks.discard)
+        raise asyncio.TimeoutError
+
     async def process_task(self, task: Dict[str, Any], worker_id: int):
         queue_name = task["name"]
         kwargs = task.get("kwargs", {})
@@ -1086,6 +1212,9 @@ class Worker:
         # requeue() call: requeue() pops "_task_json" from the task dict,
         # and the finally block below needs it for LREM cleanup.
         task_json = task.get("_task_json")
+        # When True, the finally block keeps the processing entry in place
+        # (for startup recovery) instead of removing it (V4).
+        keep_in_processing = False
         # Mark this asyncio context as "inside a worker task" so that
         # pause_queue() can detect re-entrant calls (see mTask.pause_queue).
         ctx_token = _current_worker_queue.set(self.queue_name)
@@ -1097,31 +1226,44 @@ class Worker:
             func = task_info.get("func")
             timeout = task_info.get("timeout")
             on_task_requeued = task_info.get("on_task_requeued")
+            # Cached at registration (V5) - avoids inspect.signature per task
+            model_param_name = task_info.get("model_param_name")
+            model_class = task_info.get("model_class")
             
             if not func:
                 self.logger.error(f"Task function for queue '{queue_name}' not found.")
                 raise TaskFunctionNotFoundError(
                     f"Task function for queue '{queue_name}' not found."
                 )
+
+            # Crash-loop / redelivery protection (V1): the delivery counter
+            # lives in Redis and survives process death, unlike retry_count
+            # which only advances inside the except handlers below.
+            delivery_attempts = task.get("_delivery_attempts")
+            if (
+                delivery_attempts is not None
+                and delivery_attempts > self.retry_limit + 1
+            ):
+                error_msg = (
+                    f"Task exceeded max delivery attempts "
+                    f"({delivery_attempts} > {self.retry_limit + 1}); "
+                    f"likely crashing the worker on each run"
+                )
+                self.logger.error(
+                    f"Worker {worker_id}: Task {task['id']} {error_msg}"
+                )
+                if self.record_metric_callback:
+                    await self.record_metric_callback(self.queue_name, "failed")
+                if self.enable_dlq and self.move_to_dlq_callback:
+                    await self.move_to_dlq_callback(task, self.queue_name, error_msg)
+                await self.task_queue.clear_delivery_attempts(self.queue_name, task["id"])
+                return
     
             # Execute the task
             task["start_time"] = time.time()
             self.logger.info(
                 f"Worker {worker_id}: Executing task {task['id']} from queue '{queue_name}'"
             )
-
-            sig = inspect.signature(func)
-            model_param_name: Optional[str] = None
-            model_class: Optional[type] = None
-            for name, param in sig.parameters.items():
-                if (
-                    param.annotation
-                    and inspect.isclass(param.annotation)
-                    and issubclass(param.annotation, BaseModel)
-                ):
-                    model_param_name = name
-                    model_class = param.annotation
-                    break
 
             if model_param_name and model_class:
                 data_model = model_class(**kwargs)
@@ -1130,24 +1272,20 @@ class Worker:
                 )
                 # Pass the model using the actual parameter name from the signature
                 call_kwargs = {model_param_name: data_model}
-                if timeout:
-                    await asyncio.wait_for(func(**call_kwargs), timeout=timeout)
-                else:
-                    await func(**call_kwargs)
+                await self._run_with_timeout(func(**call_kwargs), timeout)
             else:
                 self.logger.info(
                     f"Worker {worker_id}: Executing task {task['id']} - '{queue_name}' with kwargs={kwargs}"
                 )
-                if timeout:
-                    await asyncio.wait_for(func(**kwargs), timeout=timeout)
-                else:
-                    await func(**kwargs)
+                await self._run_with_timeout(func(**kwargs), timeout)
 
             # Record successful completion metrics
             execution_time = time.time() - task["start_time"]
             if self.record_metric_callback:
                 await self.record_metric_callback(self.queue_name, "completed")
                 await self.record_metric_callback(self.queue_name, "execution_time", execution_time)
+            # Task done for good: drop its delivery counter (V1)
+            await self.task_queue.clear_delivery_attempts(self.queue_name, task["id"])
             
             self.logger.info(
                 f"Worker {worker_id}: Task {task['id']} completed successfully in {execution_time:.2f}s."
@@ -1182,6 +1320,7 @@ class Worker:
                 await self.record_metric_callback(self.queue_name, "failed")
             if self.enable_dlq and self.move_to_dlq_callback:
                 await self.move_to_dlq_callback(task, self.queue_name, error_msg)
+            await self.task_queue.clear_delivery_attempts(self.queue_name, task["id"])
         except asyncio.TimeoutError:
             self.logger.error(
                 f"Worker {worker_id}: Task {task['id']} exceeded timeout of {timeout} seconds."
@@ -1196,12 +1335,16 @@ class Worker:
                     # Record requeue metric
                     if self.record_metric_callback:
                         await self.record_metric_callback(self.queue_name, "requeued")
-                    # Вызов колбэка, если задан
-                    if on_task_requeued:
-                        await on_task_requeued(task, "timeout")
+                    # Fire the requeue callback off the hot path (V7) so a slow
+                    # or hanging callback cannot block the worker slot.
+                    self._spawn_callback(on_task_requeued, task, "timeout")
                 except TaskRequeueError as re:
+                    # Requeue failed: keep the processing entry for recovery
+                    # instead of dropping the task (V4).
+                    keep_in_processing = True
                     self.logger.error(
-                        f"Worker {worker_id}: Failed to requeue task {task['id']}: {re}"
+                        f"Worker {worker_id}: Failed to requeue task {task['id']}: {re} "
+                        f"(kept in processing for recovery)"
                     )
             else:
                 error_msg = f"Task exceeded timeout of {timeout}s after {self.retry_limit} retries"
@@ -1211,6 +1354,7 @@ class Worker:
                     await self.record_metric_callback(self.queue_name, "failed")
                 if self.enable_dlq and self.move_to_dlq_callback:
                     await self.move_to_dlq_callback(task, self.queue_name, error_msg)
+                await self.task_queue.clear_delivery_attempts(self.queue_name, task["id"])
         except Exception as e:
             self.logger.exception(
                 f"Worker {worker_id}: Error executing task {task['id']}: {e}"
@@ -1225,11 +1369,13 @@ class Worker:
                     # Record requeue metric
                     if self.record_metric_callback:
                         await self.record_metric_callback(self.queue_name, "requeued")
-                    # Можно также вызвать колбэк здесь для других причин (например 'error'),
-                    # если это понадобится
                 except TaskRequeueError as re:
+                    # Requeue failed: keep the processing entry for recovery
+                    # instead of dropping the task (V4).
+                    keep_in_processing = True
                     self.logger.error(
-                        f"Worker {worker_id}: Failed to requeue task {task['id']}: {re}"
+                        f"Worker {worker_id}: Failed to requeue task {task['id']}: {re} "
+                        f"(kept in processing for recovery)"
                     )
             else:
                 error_msg = str(e) if e else "Unknown error"
@@ -1241,6 +1387,7 @@ class Worker:
                     await self.record_metric_callback(self.queue_name, "failed")
                 if self.enable_dlq and self.move_to_dlq_callback:
                     await self.move_to_dlq_callback(task, self.queue_name, error_msg)
+                await self.task_queue.clear_delivery_attempts(self.queue_name, task["id"])
         finally:
             _current_worker_queue.reset(ctx_token)
             self._active_tasks -= 1
@@ -1249,7 +1396,9 @@ class Worker:
                 # pops "_task_json" from the dict), so the old processing
                 # entry is removed even after a retry was scheduled.
                 # Note: use self.queue_name (worker's queue), not queue_name (task's name)
-                if task_json:
+                # keep_in_processing means a requeue failed and we deliberately
+                # leave the entry for startup recovery (V4).
+                if task_json and not keep_in_processing:
                     await self.task_queue.mark_completed(task_json, self.queue_name)
                     self.logger.info(
                         f"Worker {worker_id}: Task {task['id']} removed from processing queue."
@@ -1604,18 +1753,26 @@ class mTask:
                     f"Task function '{func.__name__}' for queue '{queue_name}' "
                     f"must be an async function"
                 )
+            # Resolve the pydantic-model parameter once at registration time
+            # (V5): process_task reuses this instead of calling
+            # inspect.signature() on every single task execution.
+            model_param_name: Optional[str] = None
+            model_class: Optional[type] = None
             for param_name, param in inspect.signature(func).parameters.items():
                 if (
                     param.annotation
                     and inspect.isclass(param.annotation)
                     and issubclass(param.annotation, BaseModel)
-                    and param.kind == inspect.Parameter.POSITIONAL_ONLY
                 ):
-                    raise ValueError(
-                        f"Model parameter '{param_name}' of task function "
-                        f"'{func.__name__}' must be addressable by keyword "
-                        f"(it is positional-only)"
-                    )
+                    if param.kind == inspect.Parameter.POSITIONAL_ONLY:
+                        raise ValueError(
+                            f"Model parameter '{param_name}' of task function "
+                            f"'{func.__name__}' must be addressable by keyword "
+                            f"(it is positional-only)"
+                        )
+                    if model_param_name is None:
+                        model_param_name = param_name
+                        model_class = param.annotation
 
             # Registration happens at startup, no concurrency issues
             self.task_registry[queue_name] = {
@@ -1624,6 +1781,8 @@ class mTask:
                 "timeout": timeout,
                 "on_task_requeued": on_task_requeued,
                 "rate_limit": rate_limit,
+                "model_param_name": model_param_name,
+                "model_class": model_class,
             }
             self.queue_status[queue_name] = "Running"
 

@@ -1,5 +1,51 @@
 # Bug Fixes Applied
 
+## v0.3.1 — Worker logic hardening
+
+Public API unchanged (no changed signatures; existing karma code needs no edits). New internal field `_delivery_attempts` is stripped on requeue; a new Redis key `{queue}:attempts` is created automatically.
+
+- **V1 — crash-loop / infinite redelivery protection (Critical).** `retry_count`
+  only advances inside the `except` handlers of `process_task`, so a task that
+  kills the whole process (OOM, container kill, segfault) before those run was
+  recovered from `{queue}:processing` and re-executed forever. A delivery
+  counter is now kept in a Redis hash `{queue}:attempts` (HINCRBY on every
+  dequeue, survives process death). When deliveries exceed `retry_limit + 1`,
+  the task goes straight to the DLQ. The counter is cleared (`HDEL`) on success,
+  DLQ, and non-retryable failures. This also bounds V8 (sibling redelivery on
+  re-entrant `pause_queue`).
+- **V3 — timeout now frees the worker slot (High).** `asyncio.wait_for` waits
+  indefinitely for an uncooperative coroutine to finish cancelling, so a handler
+  that swallows `CancelledError` pinned the concurrency slot forever. Execution
+  now goes through `Worker._run_with_timeout`: cancel, wait a short grace period
+  (`cancel_grace_period`, default 1s), then free the slot regardless. A still
+  -running coroutine is detached with a strong reference kept (so it is not GC'd)
+  and the task is retried/DLQ'd as before. Handlers should be cooperative to
+  cancellation; a timed-out handler may briefly keep running in the background
+  (at-least-once).
+- **V4 — no task loss when requeue fails after a timeout/error (High).**
+  Previously the `finally` block always removed the processing entry, so if
+  `requeue()` failed (e.g. Redis briefly down) the task was dropped entirely.
+  A `keep_in_processing` flag now leaves the entry for startup recovery.
+- **V5 — signature resolved once at registration (Medium).** The pydantic-model
+  parameter name/class is computed in the `@agent` decorator and cached in
+  `task_registry`, instead of calling `inspect.signature()` on every task.
+- **V6 — delayed-promote throttled per queue (Medium).** The promote Lua script
+  ran on every poll of every worker; it is now throttled to once per
+  `_promote_interval` (0.5s) per queue, cutting redundant `ZRANGEBYSCORE` load
+  under high concurrency on idle queues.
+- **V7 — `on_task_requeued` off the hot path (Medium).** The callback runs as a
+  tracked background task (`Worker._spawn_callback`) with exceptions logged, so
+  a slow/hanging callback cannot hold the worker slot.
+- **V9 — optional orjson (Low).** Internal `_dumps`/`_loads` use orjson when
+  installed, falling back to stdlib `json`. Safe for LREM matching since the
+  exact stored string is always reused.
+
+Note: V2 (all queues/workers share one event loop, so a blocking or
+cancellation-ignoring handler can slow every queue in the process) is
+architectural and not fixable inside the library — mitigate via deployment
+topology (multiple worker processes per queue group) and handler discipline
+(`asyncio.to_thread` / executors for blocking or CPU-bound work).
+
 ## v0.3.0 — Audit fixes (27 findings)
 
 The public API is unchanged: `mTask(...)`, `@agent` / `@interval` / `@cron`,

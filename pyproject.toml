@@ -3,7 +3,7 @@ authors = ["Your Name <your.email@example.com>"]
 description = "μTask is a simple task queue and scheduler library using Redis and asyncio"
 license = "MIT"
 name = "mtask"
-version = "0.3.0"
+version = "0.3.1"
 
 [tool.poetry.dependencies]
 croniter = "^2.0.0,<3.0.0"

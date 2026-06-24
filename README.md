@@ -43,3 +43,13 @@ async def first_checker(data: CheckerAuctionTask):
   key first — older versions do not read it.
 - **Delivery semantics are at-least-once.** A task may be re-executed after a
   crash or forced shutdown; make handlers idempotent.
+- **Make handlers cooperative to cancellation.** Timeouts cancel the handler
+  coroutine; a handler that swallows `asyncio.CancelledError` (or runs blocking
+  / CPU-bound work without `await`) cannot be interrupted promptly. Since
+  v0.3.1 the worker slot is freed after a short grace period regardless, but a
+  stubborn coroutine may keep running in the background. Offload blocking or
+  CPU-bound work with `await asyncio.to_thread(...)` / an executor.
+- **Crash-loop protection.** A delivery counter is tracked per task in the
+  Redis hash `{queue}:attempts`. A task delivered more than `retry_limit + 1`
+  times (e.g. one that repeatedly crashes the process before its retry logic
+  runs) is moved to the DLQ instead of looping forever.

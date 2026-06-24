@@ -1,6 +1,7 @@
-"""Regression tests for the bugs fixed in v0.3.0.
+"""Regression tests for the bugs fixed in v0.3.0 and v0.3.1.
 
-Each test references the finding it guards against (C1, C2, H2, M2, M3, M5).
+Each test references the finding it guards against (C1, C2, H2, M2, M3, M5,
+and the v0.3.1 hardening items V1, V3, V4).
 """
 import asyncio
 import json
@@ -218,3 +219,125 @@ async def test_unserializable_kwargs_raise_enqueue_error(fake_redis):
     mtask = make_mtask(fake_redis)
     with pytest.raises(TaskEnqueueError, match="not JSON-serializable"):
         await mtask.task_queue.enqueue(queue_name="q", kwargs={"bad": object()})
+
+
+# ---------------------------------------------------------------------------
+# v0.3.1 hardening regressions (V1, V3, V4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_delivery_attempts_caps_crash_loop(fake_redis):
+    """V1: a task that never advances retry_count (e.g. crashes the process,
+    here simulated by repeated dequeue+recovery) is sent to DLQ after
+    retry_limit + 1 deliveries, and its attempts counter is cleaned up."""
+    mtask = make_mtask(fake_redis)
+
+    @mtask.agent(queue_name="q")
+    async def handler(**kwargs):
+        pass
+
+    worker = make_worker(mtask, retry_limit=3)  # cap = 4 deliveries
+    await mtask.task_queue.enqueue(queue_name="q", kwargs={"n": 1})
+
+    # Simulate the poison-pill loop: dequeue (increments the Redis counter),
+    # then "crash" before completion by recovering the processing entry back
+    # to the main queue without touching retry_count.
+    dlq_len = 0
+    for _ in range(10):
+        task = await mtask.task_queue.dequeue(queue_name="q")
+        if task is None:
+            break
+        attempts = task["_delivery_attempts"]
+        if attempts > worker.retry_limit + 1:
+            # process_task should now divert it to the DLQ
+            await worker.process_task(task, worker_id=1)
+            break
+        # crash before finishing: move processing entry back to main queue
+        await mtask.task_queue.recover_processing_tasks("q")
+
+    dlq_len = await fake_redis.llen("q:dlq")
+    assert dlq_len == 1
+    dlq_task = json.loads((await fake_redis.lrange("q:dlq", 0, -1))[0])
+    assert "max delivery attempts" in dlq_task["error"]
+    # Counter cleaned up
+    assert await fake_redis.hlen("q:attempts") == 0
+
+
+@pytest.mark.asyncio
+async def test_delivery_attempts_cleared_on_success(fake_redis):
+    """V1: a normally-completing task leaves no entry in {queue}:attempts."""
+    mtask = make_mtask(fake_redis)
+
+    @mtask.agent(queue_name="q")
+    async def handler(**kwargs):
+        pass
+
+    worker = make_worker(mtask)
+    await mtask.task_queue.enqueue(queue_name="q", kwargs={"n": 1})
+    task = await mtask.task_queue.dequeue(queue_name="q")
+    assert task["_delivery_attempts"] == 1
+    await worker.process_task(task, worker_id=1)
+    assert await fake_redis.hlen("q:attempts") == 0
+
+
+@pytest.mark.asyncio
+async def test_timeout_frees_slot_for_uncooperative_handler(fake_redis):
+    """V3: a handler that swallows CancelledError must not pin the worker
+    slot; process_task returns and the task is retried."""
+    mtask = make_mtask(fake_redis)
+
+    @mtask.agent(queue_name="q", timeout=1)
+    async def stubborn(**kwargs):
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            # Ignore the cancellation and keep "working" briefly
+            await asyncio.sleep(30)
+
+    worker = make_worker(mtask, retry_limit=3)
+    worker.cancel_grace_period = 0.2  # keep the test fast
+    await mtask.task_queue.enqueue(queue_name="q", kwargs={"n": 1})
+    task = await mtask.task_queue.dequeue(queue_name="q")
+
+    # Must return promptly (well under the handler's 30s sleeps)
+    await asyncio.wait_for(worker.process_task(task, worker_id=1), timeout=5)
+
+    # Slot freed and task scheduled for retry (parked in delayed zset)
+    assert worker._active_tasks == 0
+    assert await fake_redis.zcard("q:delayed") == 1
+    # The detached coroutine is tracked; cancel it to keep the test clean
+    assert worker._detached_tasks
+    for t in list(worker._detached_tasks):
+        t.cancel()
+    await asyncio.gather(*worker._detached_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_no_task_loss_when_requeue_fails_after_timeout(fake_redis):
+    """V4: if requeue fails after a timeout, the processing entry is kept
+    for startup recovery instead of being silently dropped."""
+    mtask = make_mtask(fake_redis)
+
+    @mtask.agent(queue_name="q", timeout=1)
+    async def slow(**kwargs):
+        await asyncio.sleep(30)
+
+    worker = make_worker(mtask, retry_limit=3)
+    worker.cancel_grace_period = 0.2
+    await mtask.task_queue.enqueue(queue_name="q", kwargs={"n": 1})
+    task = await mtask.task_queue.dequeue(queue_name="q")
+    assert await fake_redis.llen("q:processing") == 1
+
+    # Make requeue fail
+    from mtask import TaskRequeueError
+
+    async def boom(*args, **kwargs):
+        raise TaskRequeueError("redis down")
+
+    mtask.task_queue.requeue = boom
+
+    await asyncio.wait_for(worker.process_task(task, worker_id=1), timeout=5)
+
+    # Entry kept in processing (recoverable), not lost
+    assert await fake_redis.llen("q:processing") == 1
