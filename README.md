@@ -53,3 +53,18 @@ async def first_checker(data: CheckerAuctionTask):
   Redis hash `{queue}:attempts`. A task delivered more than `retry_limit + 1`
   times (e.g. one that repeatedly crashes the process before its retry logic
   runs) is moved to the DLQ instead of looping forever.
+- **Breaking a loader ↔ DLQ loop.** If a producer keeps enqueueing work that
+  already failed (same `report_id` in kwargs but a new task uuid each time),
+  check the DLQ at the start of the agent handler and finalize in your DB:
+
+  ```python
+  matches = await mtask.find_dlq_tasks(
+      "my_queue", kwargs_match={"report_id": data.report_id}
+  )
+  if matches:
+      await finalize_failed_report(data.report_id, matches[0].get("error"))
+      await mtask.remove_dlq_tasks(
+          "my_queue", kwargs_match={"report_id": data.report_id}
+      )
+      return
+  ```

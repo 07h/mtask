@@ -1,5 +1,21 @@
 # Bug Fixes Applied
 
+## v0.3.2 — DLQ lookup and removal by kwargs
+
+Additive API only; existing `get_dlq_tasks`, `retry_dlq_task`, and `clear_dlq`
+are unchanged.
+
+- **`find_dlq_tasks(queue_name, *, kwargs_match)`** — returns DLQ entries whose
+  `kwargs` contain every key-value pair in `kwargs_match` (subset match). Does
+  not modify the DLQ. Use at the start of an agent handler when a loader may
+  re-enqueue the same business payload under a new task id after a prior failure.
+- **`remove_dlq_tasks(queue_name, *, kwargs_match=None, task_id=None) -> int`**
+  — removes matching entries without re-enqueueing (unlike `retry_dlq_task`).
+  Exactly one selector is required. Also clears `{queue}:attempts` for each
+  removed task id. `task_id` is for admin use when the DLQ entry uuid is known.
+- Internal **`_iter_dlq_entries`** shared by DLQ helpers to avoid duplicated
+  `LRANGE` + parse logic.
+
 ## v0.3.1 — Worker logic hardening
 
 Public API unchanged (no changed signatures; existing karma code needs no edits). New internal field `_delivery_attempts` is stripped on requeue; a new Redis key `{queue}:attempts` is created automatically.

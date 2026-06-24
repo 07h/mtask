@@ -10,7 +10,7 @@ import uuid
 from contextvars import ContextVar
 from functools import wraps
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, Optional, List, Awaitable
+from typing import Any, AsyncIterator, Callable, Dict, Optional, List, Awaitable, Tuple
 from enum import Enum
 import random
 
@@ -1980,65 +1980,176 @@ class mTask:
         except Exception as e:
             self.logger.exception(f"Failed to move task {task['id']} to DLQ: {e}")
 
+    @staticmethod
+    def _kwargs_match(task: Dict[str, Any], kwargs_match: Dict[str, Any]) -> bool:
+        """True when task kwargs contain all key-value pairs from kwargs_match."""
+        task_kwargs = task.get("kwargs")
+        if not isinstance(task_kwargs, dict):
+            return False
+        return all(task_kwargs.get(k) == v for k, v in kwargs_match.items())
+
+    async def _iter_dlq_entries(
+        self, queue_name: str
+    ) -> AsyncIterator[Tuple[str, Optional[Dict[str, Any]]]]:
+        """Yield (raw_json, parsed_task) for every entry in the DLQ list.
+
+        parsed_task is None for poison / non-dict entries (same semantics as
+        get_dlq_tasks for unparseable JSON).
+        """
+        dlq_name = f"{queue_name}:dlq"
+        await self.task_queue.ensure_connected()
+        tasks_json = await asyncio.wait_for(
+            self.task_queue.redis.lrange(dlq_name, 0, -1),
+            timeout=self.task_queue.operation_timeout,
+        )
+        for task_json in tasks_json:
+            try:
+                task = json.loads(task_json)
+            except (json.JSONDecodeError, ValueError):
+                yield task_json, None
+                continue
+            if isinstance(task, dict):
+                yield task_json, task
+            else:
+                yield task_json, None
+
+    async def _remove_dlq_raw(self, queue_name: str, task_json: str) -> None:
+        """Remove one exact DLQ list element (LREM needs the original string)."""
+        dlq_name = f"{queue_name}:dlq"
+        await asyncio.wait_for(
+            self.task_queue.redis.lrem(dlq_name, 0, task_json),
+            timeout=self.task_queue.operation_timeout,
+        )
+
     async def get_dlq_tasks(self, queue_name: str) -> List[Dict[str, Any]]:
         """Get all tasks from the Dead Letter Queue for a specific queue."""
         dlq_name = f"{queue_name}:dlq"
         try:
-            await self.task_queue.ensure_connected()
-            tasks_json = await asyncio.wait_for(
-                self.task_queue.redis.lrange(dlq_name, 0, -1),
-                timeout=self.task_queue.operation_timeout,
-            )
             tasks = []
-            for task_json in tasks_json:
-                try:
-                    tasks.append(json.loads(task_json))
-                except (json.JSONDecodeError, ValueError):
-                    # Poison messages land in the DLQ as raw strings
-                    tasks.append({"id": None, "raw": task_json, "status": "failed"})
+            async for task_json, task in self._iter_dlq_entries(queue_name):
+                if task is not None:
+                    tasks.append(task)
+                else:
+                    tasks.append(
+                        {"id": None, "raw": task_json, "status": "failed"}
+                    )
             return tasks
         except Exception as e:
             self.logger.exception(f"Failed to get DLQ tasks from '{dlq_name}': {e}")
             return []
 
+    async def find_dlq_tasks(
+        self,
+        queue_name: str,
+        *,
+        kwargs_match: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Find DLQ entries whose task kwargs contain all pairs in kwargs_match.
+
+        Useful when the worker receives a new task id but the same business
+        payload (e.g. report_id) as a previously failed attempt still sitting
+        in the DLQ. Poison / unparseable entries are skipped.
+        """
+        if not kwargs_match:
+            raise ValueError("kwargs_match must be a non-empty dict")
+        try:
+            matches = []
+            async for _raw, task in self._iter_dlq_entries(queue_name):
+                if task is not None and self._kwargs_match(task, kwargs_match):
+                    matches.append(task)
+            return matches
+        except ValueError:
+            raise
+        except Exception as e:
+            self.logger.exception(
+                f"Failed to find DLQ tasks in '{queue_name}:dlq': {e}"
+            )
+            return []
+
+    async def remove_dlq_tasks(
+        self,
+        queue_name: str,
+        *,
+        kwargs_match: Optional[Dict[str, Any]] = None,
+        task_id: Optional[str] = None,
+    ) -> int:
+        """Remove entries from the DLQ without re-enqueueing them.
+
+        Exactly one of kwargs_match or task_id must be provided:
+        - kwargs_match: remove ALL entries whose kwargs contain every pair
+          (typical agent use case: drop stale failures for the same report_id)
+        - task_id: remove by the mtask task uuid stored in the DLQ entry
+          (admin / logs use case)
+
+        Returns the number of entries removed. Also clears delivery-attempt
+        counters ({queue}:attempts) for each removed task id.
+        """
+        if (kwargs_match is None) == (task_id is None):
+            raise ValueError("Exactly one of kwargs_match or task_id is required")
+        if kwargs_match is not None and not kwargs_match:
+            raise ValueError("kwargs_match must be a non-empty dict")
+
+        removed = 0
+        try:
+            async for raw, task in self._iter_dlq_entries(queue_name):
+                if task is None:
+                    continue
+                if task_id is not None:
+                    if task.get("id") != task_id:
+                        continue
+                elif not self._kwargs_match(task, kwargs_match):
+                    continue
+
+                await self._remove_dlq_raw(queue_name, raw)
+                tid = task.get("id")
+                if tid:
+                    await self.task_queue.clear_delivery_attempts(queue_name, tid)
+                removed += 1
+
+            if removed:
+                self.logger.info(
+                    f"Removed {removed} task(s) from DLQ '{queue_name}:dlq'"
+                )
+            return removed
+        except ValueError:
+            raise
+        except Exception as e:
+            self.logger.exception(
+                f"Failed to remove tasks from DLQ '{queue_name}:dlq': {e}"
+            )
+            return removed
+
     async def retry_dlq_task(self, task_id: str, queue_name: str) -> bool:
         """Retry a task from the Dead Letter Queue by re-enqueueing it."""
         dlq_name = f"{queue_name}:dlq"
         try:
-            await self.task_queue.ensure_connected()
-            tasks_json = await asyncio.wait_for(
-                self.task_queue.redis.lrange(dlq_name, 0, -1),
-                timeout=self.task_queue.operation_timeout,
-            )
-            for index, task_json in enumerate(tasks_json):
-                try:
-                    task = json.loads(task_json)
-                except (json.JSONDecodeError, ValueError):
+            async for task_json, task in self._iter_dlq_entries(queue_name):
+                if task is None:
                     continue
-                if isinstance(task, dict) and task.get('id') == task_id:
-                    # Remove from DLQ
-                    await asyncio.wait_for(
-                        self.task_queue.redis.lrem(dlq_name, 0, task_json),
-                        timeout=self.task_queue.operation_timeout,
-                    )
-                    
-                    # Reset task for retry and strip internal/stale fields
-                    task['retry_count'] = 0
-                    task['status'] = 'pending'
-                    task.pop('error', None)
-                    task.pop('failed_at', None)
-                    task.pop('start_time', None)
-                    task.pop('_task_json', None)
-                    task.pop('retry_after', None)
-                    
-                    # Re-enqueue
-                    await asyncio.wait_for(
-                        self.task_queue.redis.rpush(queue_name, json.dumps(task)),
-                        timeout=self.task_queue.operation_timeout,
-                    )
-                    self.logger.info(f"Task {task_id} moved from DLQ back to queue '{queue_name}'")
-                    return True
-            
+                if task.get("id") != task_id:
+                    continue
+
+                await self._remove_dlq_raw(queue_name, task_json)
+
+                # Reset task for retry and strip internal/stale fields
+                task["retry_count"] = 0
+                task["status"] = "pending"
+                task.pop("error", None)
+                task.pop("failed_at", None)
+                task.pop("start_time", None)
+                task.pop("_task_json", None)
+                task.pop("retry_after", None)
+
+                # Re-enqueue
+                await asyncio.wait_for(
+                    self.task_queue.redis.rpush(queue_name, json.dumps(task)),
+                    timeout=self.task_queue.operation_timeout,
+                )
+                self.logger.info(
+                    f"Task {task_id} moved from DLQ back to queue '{queue_name}'"
+                )
+                return True
+
             self.logger.warning(f"Task {task_id} not found in DLQ '{dlq_name}'")
             return False
         except Exception as e:
