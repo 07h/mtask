@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import signal
 import time
 import uuid
@@ -228,8 +229,8 @@ class TaskQueue:
         self._priority_dequeue_script = None
         self._promote_delayed_script = None
         self._list_dequeue_script = None
-        # V6: throttle the delayed-promote script so it does not run on every
-        # poll of every worker. Maps queue_name -> last promote monotonic ts.
+        # Throttle delayed-promote so concurrent consumers do not each run it
+        # on every wait. Maps queue_name -> last promote monotonic ts.
         self._last_promote: Dict[str, float] = {}
         self._promote_interval: float = 0.5
 
@@ -509,10 +510,31 @@ class TaskQueue:
             self.logger.exception(f"Failed to enqueue task: {e}")
             raise TaskEnqueueError(f"Failed to enqueue task: {e}") from e
 
-    async def dequeue(self, queue_name: str = "default") -> Optional[Dict[str, Any]]:
+    async def promote_delayed(self, queue_name: str) -> None:
+        """Move due delayed tasks back to the main/priority queues.
+
+        Throttled per queue so concurrent callers do not each run the Lua
+        script. Safe to call from a background loop and from dequeue.
         """
-        Dequeue a task from the queue.
-        
+        await self.ensure_connected()
+        self._ensure_scripts()
+        now = time.monotonic()
+        if now - self._last_promote.get(queue_name, 0.0) < self._promote_interval:
+            return
+        self._last_promote[queue_name] = now
+        delayed_queue = f"{queue_name}:delayed"
+        priority_queue = f"{queue_name}:priority"
+        await asyncio.wait_for(
+            self._promote_delayed_script(
+                keys=[delayed_queue, priority_queue, queue_name],
+                args=[time.time(), 100],
+            ),
+            timeout=self.operation_timeout,
+        )
+
+    async def dequeue(self, queue_name: str = "default") -> Optional[Dict[str, Any]]:
+        """Non-blocking dequeue. Prefer dequeue_blocking() in workers.
+
         Returns a task dict with '_task_json' field containing the JSON string
         stored in processing queue (needed for mark_completed with LREM).
         """
@@ -524,21 +546,7 @@ class TaskQueue:
         delayed_queue = f"{queue_name}:delayed"
         
         try:
-            # Move tasks whose backoff expired from the delayed zset back
-            # into the main/priority queues (atomic Lua script). Throttled
-            # per queue (V6) so N concurrent workers do not each run this on
-            # every poll; correctness is unaffected since a slightly delayed
-            # promotion only postpones a retry by < _promote_interval.
-            now = time.monotonic()
-            if now - self._last_promote.get(queue_name, 0.0) >= self._promote_interval:
-                self._last_promote[queue_name] = now
-                await asyncio.wait_for(
-                    self._promote_delayed_script(
-                        keys=[delayed_queue, priority_queue, queue_name],
-                        args=[time.time(), 100],
-                    ),
-                    timeout=self.operation_timeout,
-                )
+            await self.promote_delayed(queue_name)
 
             # Try priority queue first: ZPOPMAX + RPUSH-to-processing is done
             # atomically in Lua, so a crash cannot lose the task in between
@@ -594,6 +602,110 @@ class TaskQueue:
             raise TaskDequeueError(
                 f"Failed to dequeue task from queue '{queue_name}': {e}"
             ) from e
+
+    async def dequeue_blocking(
+        self,
+        queue_name: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict[str, Any]]:
+        """Block until a task is available or timeout elapses.
+
+        Priority tasks are checked first (non-blocking Lua). The regular
+        list uses BLMOVE (atomic LPOP+RPUSH into processing) so a crash
+        cannot lose the task between pop and processing.
+        """
+        await self.ensure_connected()
+        self._ensure_scripts()
+
+        processing_queue = f"{queue_name}:processing"
+        priority_queue = f"{queue_name}:priority"
+        delayed_queue = f"{queue_name}:delayed"
+        deadline = time.monotonic() + max(timeout, 0.05)
+
+        try:
+            while time.monotonic() < deadline:
+                await self.promote_delayed(queue_name)
+
+                task_json = await asyncio.wait_for(
+                    self._priority_dequeue_script(
+                        keys=[priority_queue, processing_queue]
+                    ),
+                    timeout=self.operation_timeout,
+                )
+                if task_json:
+                    task = await self._prepare_dequeued_task(
+                        task_json, queue_name, processing_queue, delayed_queue
+                    )
+                    if task is not None:
+                        return task
+                    continue
+
+                remaining = max(0.05, deadline - time.monotonic())
+                task_json = await self._blmove_to_processing(
+                    queue_name, processing_queue, remaining
+                )
+                if not task_json:
+                    return None
+
+                task = await self._prepare_dequeued_task(
+                    task_json, queue_name, processing_queue, delayed_queue
+                )
+                if task is not None:
+                    return task
+            return None
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.logger.exception(
+                f"Failed to blocking-dequeue from queue '{queue_name}': {e}"
+            )
+            raise TaskDequeueError(
+                f"Failed to dequeue task from queue '{queue_name}': {e}"
+            ) from e
+
+    async def _blmove_to_processing(
+        self, queue_name: str, processing_queue: str, timeout: float
+    ) -> Optional[str]:
+        """Atomically move one list element into processing, blocking.
+
+        Falls back to a short poll via the Lua LPOP+RPUSH script when BLMOVE
+        is unavailable (older Redis / fakeredis without BLMOVE).
+        """
+        try:
+            block_for = max(0.05, float(timeout))
+            try:
+                # redis-py 6/7: blmove(src, dest, timeout, srcdir, destdir)
+                return await self.redis.blmove(
+                    queue_name,
+                    processing_queue,
+                    block_for,
+                    "LEFT",
+                    "RIGHT",
+                )
+            except TypeError:
+                # redis-py 5: blmove(src, dest, srcdir, destdir, timeout)
+                return await self.redis.blmove(
+                    queue_name,
+                    processing_queue,
+                    "LEFT",
+                    "RIGHT",
+                    block_for,
+                )
+        except (TypeError, AttributeError, NotImplementedError):
+            pass
+        except Exception as e:
+            err = str(e).lower()
+            if "unknown command" not in err and "blmove" not in err and "timeout is negative" not in err:
+                raise
+
+        await asyncio.sleep(min(timeout, 0.1))
+        task_json = await asyncio.wait_for(
+            self._list_dequeue_script(
+                keys=[queue_name, processing_queue]
+            ),
+            timeout=self.operation_timeout,
+        )
+        return task_json or None
 
     async def _prepare_dequeued_task(
         self,
@@ -992,6 +1104,71 @@ class TaskQueue:
             )
             return 0
 
+    async def get_queue_depth(self, queue_name: str) -> int:
+        """Ready work: main list + priority zset + delayed zset."""
+        try:
+            await self.ensure_connected()
+            timeout = self.operation_timeout
+            main = await asyncio.wait_for(
+                self.redis.llen(queue_name), timeout=timeout
+            )
+            priority = await asyncio.wait_for(
+                self.redis.zcard(f"{queue_name}:priority"), timeout=timeout
+            )
+            delayed = await asyncio.wait_for(
+                self.redis.zcard(f"{queue_name}:delayed"), timeout=timeout
+            )
+            return int(main or 0) + int(priority or 0) + int(delayed or 0)
+        except Exception as e:
+            self.logger.error(f"Failed to get queue depth for '{queue_name}': {e}")
+            return 0
+
+    async def set_heartbeat(self, queue_name: str, task_id: str) -> None:
+        try:
+            await self.ensure_connected()
+            await asyncio.wait_for(
+                self.redis.hset(
+                    f"{queue_name}:heartbeats", task_id, str(time.time())
+                ),
+                timeout=self.operation_timeout,
+            )
+        except Exception as e:
+            self.logger.debug(
+                f"Failed to set heartbeat for task {task_id}: {e}"
+            )
+
+    async def clear_heartbeat(self, queue_name: str, task_id: str) -> None:
+        try:
+            await self.ensure_connected()
+            await asyncio.wait_for(
+                self.redis.hdel(f"{queue_name}:heartbeats", task_id),
+                timeout=self.operation_timeout,
+            )
+        except Exception as e:
+            self.logger.debug(
+                f"Failed to clear heartbeat for task {task_id}: {e}"
+            )
+
+    async def get_heartbeats(self, queue_name: str) -> Dict[str, float]:
+        try:
+            await self.ensure_connected()
+            raw = await asyncio.wait_for(
+                self.redis.hgetall(f"{queue_name}:heartbeats"),
+                timeout=self.operation_timeout,
+            )
+            result: Dict[str, float] = {}
+            for key, value in (raw or {}).items():
+                try:
+                    result[key] = float(value)
+                except (TypeError, ValueError):
+                    continue
+            return result
+        except Exception as e:
+            self.logger.debug(
+                f"Failed to read heartbeats for '{queue_name}': {e}"
+            )
+            return {}
+
 
 # ============================
 # Worker Class
@@ -1011,6 +1188,7 @@ class Worker:
         enable_dlq: bool = True,
         move_to_dlq_callback: Optional[Callable] = None,
         record_metric_callback: Optional[Callable] = None,
+        inflight_gate: Optional[Any] = None,
     ):
         self.task_queue = task_queue
         self.retry_limit = retry_limit
@@ -1025,12 +1203,15 @@ class Worker:
         self.enable_dlq = enable_dlq
         self.move_to_dlq_callback = move_to_dlq_callback
         self.record_metric_callback = record_metric_callback
+        self.inflight_gate = inflight_gate
         # Grace period after a timeout cancellation before the slot is freed
         # regardless of whether the coroutine honoured the cancel (V3).
         self.cancel_grace_period: float = 1.0
         # Strong references so detached/background tasks are not GC'd (V3/V7)
         self._detached_tasks: set = set()
         self._bg_tasks: set = set()
+        self._handler_tasks: set = set()
+        self._semaphore: Optional[asyncio.Semaphore] = None
 
         self.logger.debug(
             f"Worker initialized with concurrency={concurrency} for queue '{queue_name}'"
@@ -1063,80 +1244,109 @@ class Worker:
             return
 
         self._running = True
+        self._semaphore = asyncio.Semaphore(self.concurrency)
         self.logger.info(
-            f"Starting {self.concurrency} worker(s) for queue '{self.queue_name}'"
+            f"Starting consumer for queue '{self.queue_name}' "
+            f"(concurrency={self.concurrency})"
         )
+        consumer = asyncio.create_task(self._consumer_loop())
+        self._workers.append(consumer)
 
-        for i in range(self.concurrency):
-            monitor_task = asyncio.create_task(self._monitor_worker(i + 1))
-            self._workers.append(monitor_task)
-
-    async def _monitor_worker(self, worker_id: int):
-        while self._running:
-            worker_task = asyncio.create_task(self._worker_loop(worker_id))
-            try:
-                await worker_task
-            except asyncio.CancelledError:
-                self.logger.info(f"Worker {worker_id}: Received shutdown signal.")
-                # Cancelling this monitor does NOT cancel the inner Task —
-                # propagate the cancellation explicitly so the worker loop
-                # actually stops and can requeue its in-flight task.
-                if not worker_task.done():
-                    worker_task.cancel()
-                    await asyncio.gather(worker_task, return_exceptions=True)
-                break
-            except Exception as e:
-                self.logger.exception(f"Worker {worker_id}: Unexpected error: {e}")
-                await asyncio.sleep(1)
-                self.logger.info(
-                    f"Worker {worker_id}: Restarting after unexpected termination."
-                )
-
-    async def _worker_loop(self, worker_id: int):
-        task = None
-        idle_sleep = 0.1
+    async def _consumer_loop(self):
+        """One blocking consumer per queue; handlers run under a semaphore."""
         while self._running:
             try:
-                task = await self.task_queue.dequeue(queue_name=self.queue_name)
-                if task:
-                    self.logger.info(
-                        f"Worker {worker_id}: Dequeued task {task['id']} from queue '{self.queue_name}'"
+                if self._semaphore is None:
+                    self._semaphore = asyncio.Semaphore(self.concurrency)
+                await self._semaphore.acquire()
+                if not self._running:
+                    self._semaphore.release()
+                    break
+                if self.inflight_gate is not None and not self.inflight_gate.try_acquire():
+                    self._semaphore.release()
+                    await asyncio.sleep(0.05)
+                    continue
+
+                try:
+                    task = await self.task_queue.dequeue_blocking(
+                        queue_name=self.queue_name, timeout=1.0
                     )
-                    # Transfer ownership: process_task handles requeue/cleanup
-                    # itself (including on cancellation), so the CancelledError
-                    # branch below must not requeue it a second time.
-                    current_task, task = task, None
-                    await self.process_task(current_task, worker_id)
-                    idle_sleep = 0.1
-                else:
-                    # Adaptive idle backoff: poll fast when busy, ease off
-                    # to 1s on an empty queue to reduce Redis load
-                    await asyncio.sleep(idle_sleep)
-                    idle_sleep = min(idle_sleep * 2, 1.0)
+                except asyncio.CancelledError:
+                    self._release_slot()
+                    raise
+                except Exception as e:
+                    self.logger.exception(
+                        f"Consumer for '{self.queue_name}': dequeue error: {e}"
+                    )
+                    self._release_slot()
+                    await asyncio.sleep(1)
+                    continue
+
+                if not task:
+                    self._release_slot()
+                    continue
+
+                self.logger.info(
+                    f"Dequeued task {task['id']} from queue '{self.queue_name}'"
+                )
+                handle = asyncio.create_task(self._run_claimed_task(task))
+                self._handler_tasks.add(handle)
+                handle.add_done_callback(self._handler_tasks.discard)
             except asyncio.CancelledError:
-                self.logger.info(f"Worker {worker_id}: Received shutdown signal.")
-                # Return task to queue if it was dequeued but not processed
-                if task:
-                    # Save _task_json before requeue (requeue removes it)
-                    task_json = task.get("_task_json")
-                    try:
-                        await self.task_queue.requeue(task, queue_name=self.queue_name, apply_backoff=False)
-                        self.logger.info(f"Worker {worker_id}: Returned task {task['id']} to queue due to shutdown.")
-                        # Remove from processing queue to prevent duplicate execution after recovery
-                        if task_json:
-                            try:
-                                await self.task_queue.mark_completed(task_json, self.queue_name)
-                            except Exception as mc_err:
-                                self.logger.warning(
-                                    f"Worker {worker_id}: Failed to remove task from processing: {mc_err}"
-                                )
-                    except Exception as e:
-                        self.logger.error(f"Worker {worker_id}: Failed to return task {task['id']} to queue: {e}")
+                self.logger.info(
+                    f"Consumer for '{self.queue_name}': Received shutdown signal."
+                )
                 break
             except Exception as e:
-                self.logger.exception(f"Worker {worker_id}: Error in worker loop: {e}")
-                task = None  # Clear task reference on error
+                self.logger.exception(
+                    f"Consumer for '{self.queue_name}': Unexpected error: {e}"
+                )
                 await asyncio.sleep(1)
+
+    def _release_slot(self) -> None:
+        if self._semaphore is not None:
+            self._semaphore.release()
+        if self.inflight_gate is not None:
+            self.inflight_gate.release()
+
+    async def _run_claimed_task(self, task: Dict[str, Any]) -> None:
+        try:
+            await self.process_task(task, worker_id=1)
+        except asyncio.CancelledError:
+            await self._return_if_still_processing(task)
+            raise
+        except Exception:
+            self.logger.exception(
+                f"Unhandled error processing task {task.get('id')} "
+                f"on queue '{self.queue_name}'"
+            )
+        finally:
+            self._release_slot()
+
+    async def _return_if_still_processing(self, task: Dict[str, Any]) -> None:
+        """If process_task never ran, put the claimed task back on the queue."""
+        task_json = task.get("_task_json")
+        if not task_json:
+            return
+        try:
+            removed = await asyncio.wait_for(
+                self.task_queue.redis.lrem(
+                    f"{self.queue_name}:processing", 1, task_json
+                ),
+                timeout=self.task_queue.operation_timeout,
+            )
+            if not removed:
+                return
+            await self.task_queue.requeue(
+                task, queue_name=self.queue_name, apply_backoff=False
+            )
+            self.logger.info(
+                f"Returned unstarted task {task.get('id')} to queue '{self.queue_name}'"
+            )
+        except Exception as e:
+            self.logger.error(
+                f"Failed to return unstarted task {task.get('id')}: {e}"
+            )
 
     async def stop(self, graceful: bool = True, timeout: int = 30):
         """Stop workers, optionally waiting for active tasks to complete."""
@@ -1161,11 +1371,14 @@ class Worker:
                 await asyncio.sleep(0.5)
         
         self.logger.info("Stopping workers...")
-        for worker_task in self._workers:
+        to_cancel = list(self._workers) + list(self._handler_tasks)
+        for worker_task in to_cancel:
             worker_task.cancel()
 
-        await asyncio.gather(*self._workers, return_exceptions=True)
+        if to_cancel:
+            await asyncio.gather(*to_cancel, return_exceptions=True)
         self._workers.clear()
+        self._handler_tasks.clear()
         self.logger.info("Workers stopped.")
 
     async def _run_with_timeout(self, coro: Awaitable, timeout: Optional[float]):
@@ -1218,6 +1431,7 @@ class Worker:
         # Mark this asyncio context as "inside a worker task" so that
         # pause_queue() can detect re-entrant calls (see mTask.pause_queue).
         ctx_token = _current_worker_queue.set(self.queue_name)
+        heartbeat_task: Optional[asyncio.Task] = None
         
         try:
             # Read without lock - task_registry is immutable after startup
@@ -1229,6 +1443,11 @@ class Worker:
             # Cached at registration (V5) - avoids inspect.signature per task
             model_param_name = task_info.get("model_param_name")
             model_class = task_info.get("model_class")
+            heartbeat_interval = task_info.get("heartbeat_interval")
+            if heartbeat_interval:
+                heartbeat_task = asyncio.create_task(
+                    self._heartbeat_loop(task["id"], heartbeat_interval)
+                )
             
             if not func:
                 self.logger.error(f"Task function for queue '{queue_name}' not found.")
@@ -1389,6 +1608,10 @@ class Worker:
                     await self.move_to_dlq_callback(task, self.queue_name, error_msg)
                 await self.task_queue.clear_delivery_attempts(self.queue_name, task["id"])
         finally:
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                await asyncio.gather(heartbeat_task, return_exceptions=True)
+                await self.task_queue.clear_heartbeat(self.queue_name, task["id"])
             _current_worker_queue.reset(ctx_token)
             self._active_tasks -= 1
             try:
@@ -1411,6 +1634,14 @@ class Worker:
                 self.logger.exception(
                     f"Worker {worker_id}: Failed to remove task {task['id']} from processing queue: {e}"
                 )
+
+    async def _heartbeat_loop(self, task_id: str, interval: float) -> None:
+        try:
+            while True:
+                await self.task_queue.set_heartbeat(self.queue_name, task_id)
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            return
 
 
 # ============================
@@ -1484,6 +1715,9 @@ class mTask:
         redis_connect_timeout: float = 10.0,
         redis_max_connections: int = 50,
         redis_health_check_interval: int = 30,
+        worker_queues: Optional[List[str]] = None,
+        max_inflight: Optional[int] = None,
+        promote_interval: float = 0.5,
     ):
         # Validate parameters
         if retry_limit < 0:
@@ -1500,6 +1734,18 @@ class mTask:
             raise ValueError("redis_connect_timeout must be > 0")
         if redis_max_connections <= 0:
             raise ValueError("redis_max_connections must be > 0")
+        if max_inflight is not None and max_inflight <= 0:
+            raise ValueError("max_inflight must be > 0 or None")
+        if promote_interval <= 0:
+            raise ValueError("promote_interval must be > 0")
+
+        if worker_queues is None:
+            raw_queues = os.environ.get("MTASK_WORKER_QUEUES", "").strip()
+            worker_queues = (
+                [q.strip() for q in raw_queues.split(",") if q.strip()]
+                if raw_queues
+                else None
+            )
         
         # Store Redis parameters for TaskQueue creation
         self._redis_url = redis_url
@@ -1507,6 +1753,9 @@ class mTask:
         self._redis_connect_timeout = redis_connect_timeout
         self._redis_max_connections = redis_max_connections
         self._redis_health_check_interval = redis_health_check_interval
+        self.worker_queues = worker_queues
+        self.max_inflight = max_inflight
+        self._global_inflight = 0
         
         self.task_queue = TaskQueue(
             redis_url=redis_url,
@@ -1515,6 +1764,7 @@ class mTask:
             max_connections=redis_max_connections,
             health_check_interval=redis_health_check_interval,
         )
+        self.task_queue._promote_interval = promote_interval
         self.task_registry: Dict[str, Dict[str, Any]] = {}
         self.workers: Dict[str, Worker] = {}
         self.scheduled_tasks: List[ScheduledTask] = []
@@ -1531,6 +1781,7 @@ class mTask:
         # (keeping references prevents GC and lets us observe exceptions)
         self._monitor_task: Optional[asyncio.Task] = None
         self._scheduler_task: Optional[asyncio.Task] = None
+        self._promote_task: Optional[asyncio.Task] = None
         self._background_tasks: set = set()
 
         # Locks are created lazily inside the running event loop:
@@ -1573,6 +1824,32 @@ class mTask:
         if self._metrics_lock is None:
             self._metrics_lock = asyncio.Lock()
         return self._metrics_lock
+
+    def try_acquire(self) -> bool:
+        """Inflight gate used by Worker consumers (max_inflight)."""
+        if self.max_inflight is None:
+            return True
+        if self._global_inflight >= self.max_inflight:
+            return False
+        self._global_inflight += 1
+        return True
+
+    def release(self) -> None:
+        if self.max_inflight is None:
+            return
+        self._global_inflight = max(0, self._global_inflight - 1)
+
+    def _owned_queue_names(self) -> List[str]:
+        names = list(self.task_registry.keys())
+        if self.worker_queues is None:
+            return names
+        wanted = set(self.worker_queues)
+        unknown = wanted - set(names)
+        if unknown:
+            raise ValueError(
+                f"worker_queues contains unregistered queue(s): {sorted(unknown)}"
+            )
+        return [q for q in names if q in wanted]
 
     def _spawn_background(self, coro: Awaitable, name: str) -> asyncio.Task:
         """Create a background task, keep a reference and log its failure.
@@ -1644,6 +1921,32 @@ class mTask:
                             metrics["total_execution_time"] / metrics["task_count"]
                         )
                 return result
+
+    async def get_queue_depth(self, queue_name: str) -> int:
+        """Ready work waiting in the queue (main + priority + delayed)."""
+        return await self.task_queue.get_queue_depth(queue_name)
+
+    async def get_processing_count(self, queue_name: str) -> int:
+        return await self.task_queue.get_processing_task_count(queue_name)
+
+    def get_inflight_count(self) -> int:
+        return sum(w._active_tasks for w in self.workers.values())
+
+    async def get_worker_stats(self) -> Dict[str, Dict[str, Any]]:
+        """Per-queue snapshot: concurrency, inflight, paused, depth."""
+        stats: Dict[str, Dict[str, Any]] = {}
+        for queue_name in self.task_registry:
+            worker = self.workers.get(queue_name)
+            status = await self._get_queue_status(queue_name)
+            stats[queue_name] = {
+                "concurrency": self.task_registry[queue_name].get("concurrency", 1),
+                "inflight": worker._active_tasks if worker else 0,
+                "paused": status == "Paused",
+                "owned": queue_name in self.workers,
+                "depth": await self.get_queue_depth(queue_name),
+                "processing": await self.get_processing_count(queue_name),
+            }
+        return stats
 
     def _initialize_status_report_task(self):
         @self.interval(seconds=300)
@@ -1722,6 +2025,7 @@ class mTask:
             Callable[[Dict[str, Any], str], Awaitable[None]]
         ] = None,
         rate_limit: Optional[int] = None,
+        heartbeat_interval: Optional[float] = None,
     ):
         """
         Decorator to define and register a task.
@@ -1735,6 +2039,9 @@ class mTask:
                 decorated wrapper (None for unlimited). Note: this limits the
                 producer side, not worker execution rate, and does not apply
                 to add_task().
+            heartbeat_interval (float, optional): Seconds between Redis
+                heartbeats while the handler runs. Stale heartbeats are
+                reaped by the process watchdog (3x interval).
         """
         # Validate parameters
         if concurrency <= 0:
@@ -1743,6 +2050,8 @@ class mTask:
             raise ValueError("timeout must be > 0 or None")
         if rate_limit is not None and rate_limit <= 0:
             raise ValueError("rate_limit must be > 0 or None")
+        if heartbeat_interval is not None and heartbeat_interval <= 0:
+            raise ValueError("heartbeat_interval must be > 0 or None")
         if not queue_name or not isinstance(queue_name, str):
             raise ValueError("queue_name must be a non-empty string")
 
@@ -1781,6 +2090,7 @@ class mTask:
                 "timeout": timeout,
                 "on_task_requeued": on_task_requeued,
                 "rate_limit": rate_limit,
+                "heartbeat_interval": heartbeat_interval,
                 "model_param_name": model_param_name,
                 "model_class": model_class,
             }
@@ -2195,6 +2505,7 @@ class mTask:
             enable_dlq=self.enable_dlq,
             move_to_dlq_callback=self._move_to_dlq,
             record_metric_callback=self._record_metric,
+            inflight_gate=self,
         )
         self.workers[queue_name] = worker
         self._spawn_background(worker.start(), f"worker-start:{queue_name}")
@@ -2211,7 +2522,9 @@ class mTask:
                     )
             await asyncio.sleep(1)
 
-    async def connect_and_start_workers(self):
+    async def connect_and_start_workers(
+        self, *, workers: bool = True, scheduler: bool = True
+    ):
         try:
             # Reuse the TaskQueue created in __init__ to avoid repeated connects/log spam
             # and duplicated health-check loops.
@@ -2221,15 +2534,87 @@ class mTask:
             self.logger.error(f"Cannot start workers without Redis connection: {e}")
             raise
 
-        queue_names = list(self.task_registry.keys())
+        if workers:
+            queue_names = self._owned_queue_names()
+            for queue_name in queue_names:
+                await self.task_queue.recover_processing_tasks(queue_name)
 
-        for queue_name in queue_names:
-            await self.task_queue.recover_processing_tasks(queue_name)
+            for queue_name in queue_names:
+                self.start_worker(queue_name=queue_name)
 
-        for queue_name in queue_names:
-            self.start_worker(queue_name=queue_name)
+            if self._promote_task is None or self._promote_task.done():
+                self._promote_task = asyncio.create_task(self._delayed_promote_loop())
 
-        self._scheduler_task = asyncio.create_task(self.run_scheduled_tasks())
+        if scheduler:
+            self._scheduler_task = asyncio.create_task(self.run_scheduled_tasks())
+
+    async def _delayed_promote_loop(self):
+        """Promote delayed tasks and reap stale heartbeats for owned queues."""
+        while True:
+            try:
+                await asyncio.sleep(self.task_queue._promote_interval)
+                for queue_name in list(self.workers.keys()):
+                    try:
+                        await self.task_queue.promote_delayed(queue_name)
+                        await self._reap_stale_heartbeats(queue_name)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        self.logger.debug(
+                            f"Delayed promote/heartbeat for '{queue_name}': {e}"
+                        )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.exception(f"Delayed promote loop error: {e}")
+                await asyncio.sleep(1)
+
+    async def _reap_stale_heartbeats(self, queue_name: str) -> None:
+        info = self.task_registry.get(queue_name) or {}
+        interval = info.get("heartbeat_interval")
+        if not interval:
+            return
+        stale_after = float(interval) * 3
+        heartbeats = await self.task_queue.get_heartbeats(queue_name)
+        if not heartbeats:
+            return
+        now = time.time()
+        processing_queue = f"{queue_name}:processing"
+        try:
+            entries = await asyncio.wait_for(
+                self.task_queue.redis.lrange(processing_queue, 0, -1),
+                timeout=self.task_queue.operation_timeout,
+            )
+        except Exception:
+            return
+        for task_json in entries or []:
+            try:
+                task = _loads(task_json)
+            except (json.JSONDecodeError, ValueError, TypeError):
+                continue
+            if not isinstance(task, dict):
+                continue
+            task_id = task.get("id")
+            ts = heartbeats.get(task_id)
+            if ts is None:
+                continue
+            if now - ts <= stale_after:
+                continue
+            self.logger.warning(
+                f"Stale heartbeat for task {task_id} on '{queue_name}' "
+                f"({now - ts:.0f}s); returning to queue"
+            )
+            try:
+                await self.task_queue.redis.lrem(processing_queue, 1, task_json)
+                task["_task_json"] = task_json
+                await self.task_queue.requeue(
+                    task, queue_name=queue_name, apply_backoff=False
+                )
+                await self.task_queue.clear_heartbeat(queue_name, task_id)
+            except Exception as e:
+                self.logger.error(
+                    f"Failed to requeue stale-heartbeat task {task_id}: {e}"
+                )
 
     async def graceful_shutdown(self):
         """Perform graceful shutdown of all workers and disconnect from Redis."""
@@ -2242,10 +2627,10 @@ class mTask:
 
         # Stop internal service tasks first so they don't react to the
         # workers/queues being torn down.
-        for service_task in (self._monitor_task, self._scheduler_task):
+        for service_task in (self._monitor_task, self._scheduler_task, self._promote_task):
             if service_task is not None and not service_task.done():
                 service_task.cancel()
-        for service_task in (self._monitor_task, self._scheduler_task):
+        for service_task in (self._monitor_task, self._scheduler_task, self._promote_task):
             if service_task is not None:
                 try:
                     await asyncio.gather(service_task, return_exceptions=True)
@@ -2266,14 +2651,17 @@ class mTask:
         await self.task_queue.disconnect()
         self.logger.info("Graceful shutdown completed.")
 
-    async def run(self):
+    async def run(self, *, workers: bool = True, scheduler: bool = True):
         try:
-            await self.connect_and_start_workers()
+            await self.connect_and_start_workers(
+                workers=workers, scheduler=scheduler
+            )
         except mTaskError as e:
             self.logger.error(f"Failed to start mTask: {e}")
             return
 
-        self._monitor_task = asyncio.create_task(self.monitor_queue_status())
+        if workers:
+            self._monitor_task = asyncio.create_task(self.monitor_queue_status())
 
         # Register signal handlers so SIGINT/SIGTERM trigger a real graceful
         # shutdown. Note: "except KeyboardInterrupt" inside a coroutine almost
@@ -2348,6 +2736,18 @@ class mTask:
                 self._scheduler_task.exception(),
             )
             self._scheduler_task = asyncio.create_task(self.run_scheduled_tasks())
+
+        if (
+            self._promote_task is not None
+            and self._promote_task.done()
+            and not self._promote_task.cancelled()
+            and self._promote_task.exception() is not None
+        ):
+            self.logger.warning(
+                "Delayed promote loop exited with error, restarting: %s",
+                self._promote_task.exception(),
+            )
+            self._promote_task = asyncio.create_task(self._delayed_promote_loop())
 
     async def _get_queue_status(self, queue_name: str) -> str:
         status_key = f"queue_status:{queue_name}"
@@ -2442,7 +2842,7 @@ class mTask:
                 continue
 
             try:
-                queue_names = list(self.task_registry.keys())
+                queue_names = list(self.workers.keys()) or self._owned_queue_names()
 
                 for queue_name in queue_names:
                     status_key = f"queue_status:{queue_name}"

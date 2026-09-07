@@ -303,3 +303,22 @@ async def test_get_processing_task_count(task_queue):
     count = await task_queue.get_processing_task_count("test_queue")
     assert count == 2
 
+
+@pytest.mark.asyncio
+async def test_dequeue_blocking_picks_up_task(task_queue):
+    task_id = await task_queue.enqueue(
+        queue_name="test_queue", kwargs={"key": "value"}
+    )
+    task = await task_queue.dequeue_blocking(queue_name="test_queue", timeout=2.0)
+    assert task is not None
+    assert task["id"] == task_id
+    assert await task_queue.redis.llen("test_queue:processing") == 1
+
+
+@pytest.mark.asyncio
+async def test_get_queue_depth_includes_priority_and_delayed(task_queue):
+    await task_queue.enqueue("q", kwargs={"a": 1})
+    await task_queue.enqueue("q", kwargs={"a": 2}, priority=3)
+    depth = await task_queue.get_queue_depth("q")
+    assert depth == 2
+

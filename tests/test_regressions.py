@@ -16,14 +16,14 @@ class PayloadModel(BaseModel):
     value: int
 
 
-def make_worker(mtask: mTask, queue_name: str = "q", retry_limit: int = 3) -> Worker:
+def make_worker(mtask: mTask, queue_name: str = "q", retry_limit: int = 3, concurrency: int = 1) -> Worker:
     return Worker(
         task_queue=mtask.task_queue,
         task_registry=mtask.task_registry,
         task_registry_lock=mtask.task_registry_lock,
         retry_limit=retry_limit,
         queue_name=queue_name,
-        concurrency=1,
+        concurrency=concurrency,
         logger=mtask.logger,
         enable_dlq=True,
         move_to_dlq_callback=mtask._move_to_dlq,
@@ -341,3 +341,85 @@ async def test_no_task_loss_when_requeue_fails_after_timeout(fake_redis):
 
     # Entry kept in processing (recoverable), not lost
     assert await fake_redis.llen("q:processing") == 1
+
+
+@pytest.mark.asyncio
+async def test_consumer_concurrency_semaphore(fake_redis):
+    mtask = make_mtask(fake_redis)
+    current = 0
+    max_seen = 0
+    release = asyncio.Event()
+
+    @mtask.agent(queue_name="q", concurrency=2)
+    async def handler(**kwargs):
+        nonlocal current, max_seen
+        current += 1
+        max_seen = max(max_seen, current)
+        await release.wait()
+        current -= 1
+
+    worker = make_worker(mtask, concurrency=2)
+    for i in range(4):
+        await mtask.task_queue.enqueue("q", kwargs={"n": i})
+    await worker.start()
+    await asyncio.sleep(0.5)
+    assert max_seen == 2
+    release.set()
+    await asyncio.sleep(0.3)
+    await worker.stop(graceful=True, timeout=5)
+    assert worker._active_tasks == 0
+
+
+@pytest.mark.asyncio
+async def test_max_inflight_across_queues(fake_redis):
+    mtask = make_mtask(fake_redis)
+    mtask.max_inflight = 1
+    started = []
+    gate = asyncio.Event()
+
+    @mtask.agent(queue_name="a", concurrency=5)
+    async def ha(**kwargs):
+        started.append("a")
+        await gate.wait()
+
+    @mtask.agent(queue_name="b", concurrency=5)
+    async def hb(**kwargs):
+        started.append("b")
+        await gate.wait()
+
+    wa = make_worker(mtask, queue_name="a", concurrency=5)
+    wa.inflight_gate = mtask
+    wb = make_worker(mtask, queue_name="b", concurrency=5)
+    wb.inflight_gate = mtask
+
+    await mtask.task_queue.enqueue("a", kwargs={})
+    await mtask.task_queue.enqueue("b", kwargs={})
+    await wa.start()
+    await wb.start()
+    await asyncio.sleep(0.6)
+    assert len(started) == 1
+    gate.set()
+    await wa.stop(graceful=True, timeout=5)
+    await wb.stop(graceful=True, timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_written_while_running(fake_redis):
+    mtask = make_mtask(fake_redis)
+    started = asyncio.Event()
+
+    @mtask.agent(queue_name="q", heartbeat_interval=0.1)
+    async def handler(**kwargs):
+        started.set()
+        await asyncio.sleep(30)
+
+    worker = make_worker(mtask)
+    await mtask.task_queue.enqueue("q", kwargs={"n": 1})
+    task = await mtask.task_queue.dequeue("q")
+    proc = asyncio.create_task(worker.process_task(task, worker_id=1))
+    await asyncio.wait_for(started.wait(), timeout=2)
+    await asyncio.sleep(0.25)
+    beats = await mtask.task_queue.get_heartbeats("q")
+    assert task["id"] in beats
+    proc.cancel()
+    await asyncio.gather(proc, return_exceptions=True)

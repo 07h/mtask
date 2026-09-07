@@ -111,6 +111,89 @@ async def test_metrics():
     assert metrics["avg_execution_time"] == 2.0
 
 
+def test_max_inflight_and_worker_queues_validation():
+    with pytest.raises(ValueError, match="max_inflight must be > 0"):
+        mTask(max_inflight=0)
+
+    mtask = mTask(worker_queues=["a", "b"], enable_logging=False)
+    assert mtask.worker_queues == ["a", "b"]
+    assert mtask.max_inflight is None
+
+
+def test_unknown_worker_queues_fail_at_start():
+    mtask = mTask(worker_queues=["missing"], enable_logging=False)
+
+    @mtask.agent(queue_name="real")
+    async def handler():
+        pass
+
+    with pytest.raises(ValueError, match="unregistered queue"):
+        mtask._owned_queue_names()
+
+
+def test_owned_queue_filter():
+    mtask = mTask(worker_queues=["keep"], enable_logging=False)
+
+    @mtask.agent(queue_name="keep")
+    async def keep():
+        pass
+
+    @mtask.agent(queue_name="skip")
+    async def skip():
+        pass
+
+    assert mtask._owned_queue_names() == ["keep"]
+
+
+@pytest.mark.asyncio
+async def test_queue_depth_metrics(fake_redis):
+    mtask = mTask(enable_logging=False)
+    mtask.task_queue.redis = fake_redis
+    mtask.task_queue._connection_healthy = True
+
+    await mtask.task_queue.enqueue("q", kwargs={"n": 1})
+    await mtask.task_queue.enqueue("q", kwargs={"n": 2}, priority=5)
+    depth = await mtask.get_queue_depth("q")
+    assert depth == 2
+    assert await mtask.get_processing_count("q") == 0
+    assert mtask.get_inflight_count() == 0
+
+    stats = await mtask.get_worker_stats()
+    assert stats == {}  # no agents registered
+
+    @mtask.agent(queue_name="q")
+    async def handler(**kwargs):
+        pass
+
+    stats = await mtask.get_worker_stats()
+    assert stats["q"]["depth"] == 2
+    assert stats["q"]["owned"] is False
+
+
+@pytest.mark.asyncio
+async def test_run_scheduler_only_does_not_start_workers(fake_redis):
+    mtask = mTask(enable_logging=False)
+    mtask.task_queue.redis = fake_redis
+    mtask.task_queue._connection_healthy = True
+
+    async def fake_connect():
+        mtask.task_queue._connection_healthy = True
+
+    mtask.task_queue.connect = fake_connect
+
+    @mtask.agent(queue_name="q")
+    async def handler(**kwargs):
+        pass
+
+    run_task = asyncio.create_task(mtask.run(workers=False, scheduler=True))
+    await asyncio.sleep(0.2)
+    assert mtask.workers == {}
+    assert mtask._scheduler_task is not None
+    assert mtask._monitor_task is None
+    run_task.cancel()
+    await asyncio.gather(run_task, return_exceptions=True)
+
+
 @pytest.mark.asyncio
 async def test_rate_limiting(fake_redis):
     """Test rate limiting functionality."""
