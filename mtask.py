@@ -2553,7 +2553,7 @@ class mTask:
         while True:
             try:
                 await asyncio.sleep(self.task_queue._promote_interval)
-                for queue_name in list(self.workers.keys()):
+                for queue_name in self._owned_queue_names():
                     try:
                         await self.task_queue.promote_delayed(queue_name)
                         await self._reap_stale_heartbeats(queue_name)
@@ -2832,6 +2832,43 @@ class mTask:
             self.logger.exception(f"Failed to finalize pause of queue '{queue_name}': {e}")
             raise mTaskError(f"Failed to pause queue '{queue_name}': {e}") from e
 
+    async def _refresh_queue_statuses(self) -> None:
+        """Apply Redis pause/resume flags to local workers.
+
+        Must iterate owned queues, not only live workers: pause pops the
+        worker, and a sibling still running would otherwise hide the paused
+        queue forever after the Redis TTL expires.
+        """
+        for queue_name in self._owned_queue_names():
+            status_key = f"queue_status:{queue_name}"
+            current_status = (
+                await self.task_queue.redis.get(status_key) or "Running"
+            )
+            previous_status = self.queue_status.get(queue_name, "Running")
+
+            if current_status != previous_status:
+                if current_status == "Paused":
+                    async with self.queue_status_lock:
+                        self.queue_status[queue_name] = "Paused"
+                    self.logger.info(f"Queue '{queue_name}' is paused.")
+                    # pop() avoids a KeyError race with pause_queue /
+                    # _finalize_pause removing the worker concurrently
+                    worker = self.workers.pop(queue_name, None)
+                    if worker is not None:
+                        await worker.stop(
+                            graceful=True, timeout=self.shutdown_timeout
+                        )
+                        # Return in-flight tasks so they are not stuck
+                        # in processing for the whole pause duration
+                        await self.task_queue.recover_processing_tasks(
+                            queue_name
+                        )
+                elif current_status == "Running" or current_status is None:
+                    async with self.queue_status_lock:
+                        self.queue_status[queue_name] = "Running"
+                    self.logger.info(f"Queue '{queue_name}' is resumed.")
+                    self.start_worker(queue_name)
+
     async def monitor_queue_status(self):
         while True:
             try:
@@ -2842,39 +2879,7 @@ class mTask:
                 continue
 
             try:
-                queue_names = list(self.workers.keys()) or self._owned_queue_names()
-
-                for queue_name in queue_names:
-                    status_key = f"queue_status:{queue_name}"
-                    current_status = (
-                        await self.task_queue.redis.get(status_key) or "Running"
-                    )
-                    previous_status = self.queue_status.get(queue_name, "Running")
-
-                    if current_status != previous_status:
-                        if current_status == "Paused":
-                            async with self.queue_status_lock:
-                                self.queue_status[queue_name] = "Paused"
-                            self.logger.info(f"Queue '{queue_name}' is paused.")
-                            # pop() avoids a KeyError race with pause_queue /
-                            # _finalize_pause removing the worker concurrently
-                            worker = self.workers.pop(queue_name, None)
-                            if worker is not None:
-                                await worker.stop(
-                                    graceful=True, timeout=self.shutdown_timeout
-                                )
-                                # Return in-flight tasks so they are not stuck
-                                # in processing for the whole pause duration
-                                await self.task_queue.recover_processing_tasks(
-                                    queue_name
-                                )
-                        elif current_status == "Running" or current_status is None:
-                            async with self.queue_status_lock:
-                                self.queue_status[queue_name] = "Running"
-                            self.logger.info(f"Queue '{queue_name}' is resumed.")
-                            self.start_worker(queue_name)
-                        else:
-                            pass
+                await self._refresh_queue_statuses()
             except (RedisClientConnectionError, RedisConnectionError) as e:
                 self.logger.warning(
                     "Monitor: Redis connection error while checking queue status: %s. "

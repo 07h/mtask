@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.1
+
+### Fixed
+
+- Resume after `pause_queue`: the status monitor now watches all owned queues, not only queues with a live worker. Previously a paused queue never restarted once its Redis TTL expired if any sibling worker was still running (first/second/third checkers stuck after webarchive pause).
+- Delayed-task promote loop uses the same owned-queue list, so due retries are promoted even while a queue is paused.
+
 ## 0.4.0
 
 ### Added

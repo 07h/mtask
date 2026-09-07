@@ -423,3 +423,39 @@ async def test_heartbeat_written_while_running(fake_redis):
     assert task["id"] in beats
     proc.cancel()
     await asyncio.gather(proc, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_paused_queue_resumes_after_status_key_expires(fake_redis):
+    """Sibling workers must not hide a paused queue from the resume monitor."""
+    mtask = make_mtask(fake_redis)
+    mtask.shutdown_timeout = 2
+
+    @mtask.agent(queue_name="alive")
+    async def alive(**kwargs):
+        pass
+
+    @mtask.agent(queue_name="paused")
+    async def paused(**kwargs):
+        pass
+
+    mtask.start_worker("alive")
+    mtask.start_worker("paused")
+    await asyncio.sleep(0.05)
+    assert "alive" in mtask.workers
+    assert "paused" in mtask.workers
+
+    await mtask.pause_queue("paused", duration=300)
+    assert "paused" not in mtask.workers
+    assert "alive" in mtask.workers
+    assert mtask.queue_status.get("paused") == "Paused"
+
+    await fake_redis.delete("queue_status:paused")
+    await mtask._refresh_queue_statuses()
+
+    assert "paused" in mtask.workers
+    assert "alive" in mtask.workers
+    assert mtask.queue_status.get("paused") == "Running"
+
+    await mtask.workers["alive"].stop(graceful=True, timeout=2)
+    await mtask.workers["paused"].stop(graceful=True, timeout=2)
