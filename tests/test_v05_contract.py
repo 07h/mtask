@@ -248,6 +248,39 @@ async def test_dlq_indexes_fallback_consistency_and_rebuild(fake_redis):
 
 
 @pytest.mark.asyncio
+async def test_dlq_index_falls_back_when_list_is_ahead(fake_redis):
+    instance = make_mtask(fake_redis, dlq_index_fields=["report_id"])
+    await instance._move_to_dlq(
+        {
+            "id": "new",
+            "name": "q",
+            "kwargs": {"report_id": "r1"},
+            "retry_count": 3,
+        },
+        "q",
+        "boom",
+    )
+    assert await instance.rebuild_dlq_index("q") == 1
+    await fake_redis.rpush(
+        "q:dlq",
+        json.dumps(
+            {
+                "id": "old",
+                "name": "q",
+                "kwargs": {"report_id": "r1"},
+                "status": "failed",
+            }
+        ),
+    )
+
+    matches = await instance.find_dlq_tasks(
+        "q", kwargs_match={"report_id": "r1"}
+    )
+
+    assert {task["id"] for task in matches} == {"new", "old"}
+
+
+@pytest.mark.asyncio
 async def test_public_shutdown_lifecycle(fake_redis):
     instance = make_mtask(fake_redis)
 

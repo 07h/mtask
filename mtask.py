@@ -2704,6 +2704,20 @@ class mTask:
                 )
             )
             if index_ready:
+                list_count, indexed_count = await asyncio.gather(
+                    asyncio.wait_for(
+                        self.task_queue.redis.llen(f"{queue_name}:dlq"),
+                        timeout=self.task_queue.operation_timeout,
+                    ),
+                    asyncio.wait_for(
+                        self.task_queue.redis.hlen(
+                            self._dlq_entries_key(queue_name)
+                        ),
+                        timeout=self.task_queue.operation_timeout,
+                    ),
+                )
+                index_ready = int(list_count) == int(indexed_count)
+            if index_ready:
                 keys = [
                     self._dlq_index_key(queue_name, field, value)
                     for field, value in kwargs_match.items()
