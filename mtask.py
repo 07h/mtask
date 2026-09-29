@@ -1,6 +1,7 @@
 # mTask.py
 
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
@@ -8,6 +9,7 @@ import os
 import signal
 import time
 import uuid
+from collections import deque
 from contextvars import ContextVar
 from functools import wraps
 from datetime import datetime, timedelta, timezone
@@ -122,6 +124,13 @@ class TaskStatus(str, Enum):
     FAILED = "failed"
 
 
+class TaskOutcome(str, Enum):
+    """Explicit handler outcome; every non-member legacy return is SUCCESS."""
+    SUCCESS = "success"
+    RETRY = "retry"
+    DISCARD = "discard"
+
+
 class InternalTask(BaseModel):
     """Internal task representation with type safety."""
     id: str
@@ -180,6 +189,12 @@ class TaskProcessingError(mTaskError):
 
 class TaskFunctionNotFoundError(mTaskError):
     """Raised when the task function is not found in the registry."""
+
+    pass
+
+
+class _TaskRetryRequested(Exception):
+    """Internal control flow for TaskOutcome.RETRY."""
 
     pass
 
@@ -318,7 +333,8 @@ class TaskQueue:
                     pass
         
         if self.redis:
-            await self.redis.close()
+            close = getattr(self.redis, "aclose", None) or self.redis.close
+            await close()
             self._connection_healthy = False
             self.logger.info("Disconnected from Redis")
 
@@ -1238,6 +1254,33 @@ class Worker:
 
         cb_task.add_done_callback(_on_done)
 
+    async def _requeue_task(
+        self,
+        task: Dict[str, Any],
+        reason: str,
+        callback: Optional[Callable],
+        *,
+        apply_backoff: bool = True,
+    ) -> None:
+        """Requeue and emit the single on_task_requeued contract."""
+        await self.task_queue.requeue(
+            task, queue_name=self.queue_name, apply_backoff=apply_backoff
+        )
+        if self.record_metric_callback:
+            await self.record_metric_callback(self.queue_name, "requeued")
+        self._spawn_callback(callback, task, reason)
+
+    async def _acquire_global_slot(self) -> bool:
+        if self.inflight_gate is None:
+            return False
+        acquire = getattr(self.inflight_gate, "acquire", None)
+        if acquire is not None:
+            await acquire(self.queue_name)
+            return True
+        while not self.inflight_gate.try_acquire():
+            await asyncio.sleep(0.05)
+        return True
+
     async def start(self):
         if self._running:
             self.logger.warning("Worker is already running.")
@@ -1262,34 +1305,43 @@ class Worker:
                 if not self._running:
                     self._semaphore.release()
                     break
-                if self.inflight_gate is not None and not self.inflight_gate.try_acquire():
-                    self._semaphore.release()
-                    await asyncio.sleep(0.05)
-                    continue
-
                 try:
                     task = await self.task_queue.dequeue_blocking(
                         queue_name=self.queue_name, timeout=1.0
                     )
                 except asyncio.CancelledError:
-                    self._release_slot()
+                    self._semaphore.release()
                     raise
                 except Exception as e:
                     self.logger.exception(
                         f"Consumer for '{self.queue_name}': dequeue error: {e}"
                     )
-                    self._release_slot()
+                    self._semaphore.release()
                     await asyncio.sleep(1)
                     continue
 
                 if not task:
-                    self._release_slot()
+                    self._semaphore.release()
                     continue
+
+                global_slot = False
+                try:
+                    global_slot = await self._acquire_global_slot()
+                except asyncio.CancelledError:
+                    await self._return_if_still_processing(task)
+                    self._semaphore.release()
+                    raise
+                except Exception:
+                    await self._return_if_still_processing(task)
+                    self._semaphore.release()
+                    raise
 
                 self.logger.info(
                     f"Dequeued task {task['id']} from queue '{self.queue_name}'"
                 )
-                handle = asyncio.create_task(self._run_claimed_task(task))
+                handle = asyncio.create_task(
+                    self._run_claimed_task(task, global_slot)
+                )
                 self._handler_tasks.add(handle)
                 handle.add_done_callback(self._handler_tasks.discard)
             except asyncio.CancelledError:
@@ -1303,13 +1355,18 @@ class Worker:
                 )
                 await asyncio.sleep(1)
 
-    def _release_slot(self) -> None:
+    def _release_slot(self, global_slot: bool = True) -> None:
         if self._semaphore is not None:
             self._semaphore.release()
-        if self.inflight_gate is not None:
-            self.inflight_gate.release()
+        if self.inflight_gate is not None and global_slot:
+            try:
+                self.inflight_gate.release(self.queue_name)
+            except TypeError:
+                self.inflight_gate.release()
 
-    async def _run_claimed_task(self, task: Dict[str, Any]) -> None:
+    async def _run_claimed_task(
+        self, task: Dict[str, Any], global_slot: bool = True
+    ) -> None:
         try:
             await self.process_task(task, worker_id=1)
         except asyncio.CancelledError:
@@ -1321,7 +1378,7 @@ class Worker:
                 f"on queue '{self.queue_name}'"
             )
         finally:
-            self._release_slot()
+            self._release_slot(global_slot)
 
     async def _return_if_still_processing(self, task: Dict[str, Any]) -> None:
         """If process_task never ran, put the claimed task back on the queue."""
@@ -1393,15 +1450,13 @@ class Worker:
         concurrency slot is released on timeout (V3).
         """
         if not timeout:
-            await coro
-            return
+            return await coro
 
         coro_task = asyncio.ensure_future(coro)
         done, _ = await asyncio.wait({coro_task}, timeout=timeout)
         if coro_task in done:
             # Propagate result/exception
-            coro_task.result()
-            return
+            return coro_task.result()
 
         coro_task.cancel()
         # Give the task a short window to honour the cancellation
@@ -1491,12 +1546,27 @@ class Worker:
                 )
                 # Pass the model using the actual parameter name from the signature
                 call_kwargs = {model_param_name: data_model}
-                await self._run_with_timeout(func(**call_kwargs), timeout)
+                result = await self._run_with_timeout(func(**call_kwargs), timeout)
             else:
                 self.logger.info(
                     f"Worker {worker_id}: Executing task {task['id']} - '{queue_name}' with kwargs={kwargs}"
                 )
-                await self._run_with_timeout(func(**kwargs), timeout)
+                result = await self._run_with_timeout(func(**kwargs), timeout)
+
+            # Identity checks are intentional: legacy values such as the
+            # strings "retry" and "discard" remain successful completions.
+            if result is TaskOutcome.RETRY:
+                raise _TaskRetryRequested()
+            if result is TaskOutcome.DISCARD:
+                if self.record_metric_callback:
+                    await self.record_metric_callback(self.queue_name, "discarded")
+                await self.task_queue.clear_delivery_attempts(
+                    self.queue_name, task["id"]
+                )
+                self.logger.info(
+                    f"Worker {worker_id}: Task {task['id']} discarded by handler."
+                )
+                return
 
             # Record successful completion metrics
             execution_time = time.time() - task["start_time"]
@@ -1547,16 +1617,12 @@ class Worker:
             if task["retry_count"] < self.retry_limit:
                 task["retry_count"] += 1
                 try:
-                    await self.task_queue.requeue(task, queue_name=self.queue_name)
+                    await self._requeue_task(
+                        task, "timeout", on_task_requeued
+                    )
                     self.logger.info(
                         f"Worker {worker_id}: Requeued task {task['id']} due to timeout (retry {task['retry_count']})"
                     )
-                    # Record requeue metric
-                    if self.record_metric_callback:
-                        await self.record_metric_callback(self.queue_name, "requeued")
-                    # Fire the requeue callback off the hot path (V7) so a slow
-                    # or hanging callback cannot block the worker slot.
-                    self._spawn_callback(on_task_requeued, task, "timeout")
                 except TaskRequeueError as re:
                     # Requeue failed: keep the processing entry for recovery
                     # instead of dropping the task (V4).
@@ -1574,6 +1640,32 @@ class Worker:
                 if self.enable_dlq and self.move_to_dlq_callback:
                     await self.move_to_dlq_callback(task, self.queue_name, error_msg)
                 await self.task_queue.clear_delivery_attempts(self.queue_name, task["id"])
+        except _TaskRetryRequested:
+            if task["retry_count"] < self.retry_limit:
+                task["retry_count"] += 1
+                try:
+                    await self._requeue_task(
+                        task, "task_outcome_retry", on_task_requeued
+                    )
+                except TaskRequeueError as re:
+                    keep_in_processing = True
+                    self.logger.error(
+                        f"Worker {worker_id}: Failed to requeue task {task['id']}: {re} "
+                        f"(kept in processing for recovery)"
+                    )
+            else:
+                error_msg = (
+                    f"Task requested retry after {self.retry_limit} retries"
+                )
+                if self.record_metric_callback:
+                    await self.record_metric_callback(self.queue_name, "failed")
+                if self.enable_dlq and self.move_to_dlq_callback:
+                    await self.move_to_dlq_callback(
+                        task, self.queue_name, error_msg
+                    )
+                await self.task_queue.clear_delivery_attempts(
+                    self.queue_name, task["id"]
+                )
         except Exception as e:
             self.logger.exception(
                 f"Worker {worker_id}: Error executing task {task['id']}: {e}"
@@ -1581,13 +1673,12 @@ class Worker:
             if task["retry_count"] < self.retry_limit:
                 task["retry_count"] += 1
                 try:
-                    await self.task_queue.requeue(task, queue_name=self.queue_name)
+                    await self._requeue_task(
+                        task, "exception", on_task_requeued
+                    )
                     self.logger.info(
                         f"Worker {worker_id}: Requeued task {task['id']} (retry {task['retry_count']})"
                     )
-                    # Record requeue metric
-                    if self.record_metric_callback:
-                        await self.record_metric_callback(self.queue_name, "requeued")
                 except TaskRequeueError as re:
                     # Requeue failed: keep the processing entry for recovery
                     # instead of dropping the task (V4).
@@ -1717,6 +1808,9 @@ class mTask:
         redis_health_check_interval: int = 30,
         worker_queues: Optional[List[str]] = None,
         max_inflight: Optional[int] = None,
+        fair_inflight: bool = False,
+        max_inflight_per_queue: Optional[Any] = None,
+        dlq_index_fields: Optional[List[str]] = None,
         promote_interval: float = 0.5,
     ):
         # Validate parameters
@@ -1736,6 +1830,29 @@ class mTask:
             raise ValueError("redis_max_connections must be > 0")
         if max_inflight is not None and max_inflight <= 0:
             raise ValueError("max_inflight must be > 0 or None")
+        if max_inflight_per_queue is not None:
+            if isinstance(max_inflight_per_queue, int):
+                if max_inflight_per_queue <= 0:
+                    raise ValueError(
+                        "max_inflight_per_queue must be > 0 or None"
+                    )
+            elif isinstance(max_inflight_per_queue, dict):
+                if any(
+                    not isinstance(v, int) or v <= 0
+                    for v in max_inflight_per_queue.values()
+                ):
+                    raise ValueError(
+                        "max_inflight_per_queue values must be > 0"
+                    )
+            else:
+                raise ValueError(
+                    "max_inflight_per_queue must be an int, dict, or None"
+                )
+        if dlq_index_fields is not None and (
+            not isinstance(dlq_index_fields, list)
+            or any(not isinstance(f, str) or not f for f in dlq_index_fields)
+        ):
+            raise ValueError("dlq_index_fields must be a list of non-empty strings")
         if promote_interval <= 0:
             raise ValueError("promote_interval must be > 0")
 
@@ -1755,7 +1872,12 @@ class mTask:
         self._redis_health_check_interval = redis_health_check_interval
         self.worker_queues = worker_queues
         self.max_inflight = max_inflight
+        self.fair_inflight = bool(fair_inflight)
+        self.max_inflight_per_queue = max_inflight_per_queue
+        self.dlq_index_fields = list(dict.fromkeys(dlq_index_fields or []))
         self._global_inflight = 0
+        self._queue_inflight: Dict[str, int] = {}
+        self._admission_waiters: Any = deque()
         
         self.task_queue = TaskQueue(
             redis_url=redis_url,
@@ -1774,6 +1896,14 @@ class mTask:
         self.enable_dlq = enable_dlq
         self.max_task_size = max_task_size
         self._is_shutting_down = False
+        self._shutdown_complete_event: Optional[asyncio.Event] = None
+        self._shutdown_stats: Dict[str, Any] = {
+            "started_at": None,
+            "completed_at": None,
+            "duration": None,
+            "workers": 0,
+            "inflight_at_start": 0,
+        }
         self._metrics: Dict[str, Dict[str, Any]] = {}
         self._initialize_metrics()
 
@@ -1825,19 +1955,132 @@ class mTask:
             self._metrics_lock = asyncio.Lock()
         return self._metrics_lock
 
-    def try_acquire(self) -> bool:
-        """Inflight gate used by Worker consumers (max_inflight)."""
-        if self.max_inflight is None:
+    @property
+    def is_shutting_down(self) -> bool:
+        """Whether shutdown has started."""
+        return self._is_shutting_down
+
+    def _shutdown_event(self) -> asyncio.Event:
+        if self._shutdown_complete_event is None:
+            self._shutdown_complete_event = asyncio.Event()
+        return self._shutdown_complete_event
+
+    async def wait_shutdown_complete(
+        self, timeout: Optional[float] = None
+    ) -> bool:
+        """Wait for shutdown completion; return False on timeout."""
+        event = self._shutdown_event()
+        try:
+            if timeout is None:
+                await event.wait()
+            else:
+                await asyncio.wait_for(event.wait(), timeout=timeout)
             return True
-        if self._global_inflight >= self.max_inflight:
+        except asyncio.TimeoutError:
             return False
-        self._global_inflight += 1
+
+    def get_shutdown_stats(self) -> Dict[str, Any]:
+        """Return a snapshot of the latest shutdown lifecycle."""
+        return dict(self._shutdown_stats)
+
+    @property
+    def shutdown_stats(self) -> Dict[str, Any]:
+        """Property form of get_shutdown_stats()."""
+        return self.get_shutdown_stats()
+
+    def _queue_inflight_limit(self, queue_name: Optional[str]) -> Optional[int]:
+        if queue_name is None or self.max_inflight_per_queue is None:
+            return None
+        if isinstance(self.max_inflight_per_queue, dict):
+            return self.max_inflight_per_queue.get(queue_name)
+        return self.max_inflight_per_queue
+
+    def _can_admit(self, queue_name: Optional[str]) -> bool:
+        if (
+            self.max_inflight is not None
+            and self._global_inflight >= self.max_inflight
+        ):
+            return False
+        queue_limit = self._queue_inflight_limit(queue_name)
+        if (
+            queue_limit is not None
+            and self._queue_inflight.get(queue_name or "", 0) >= queue_limit
+        ):
+            return False
         return True
 
-    def release(self) -> None:
-        if self.max_inflight is None:
+    def try_acquire(self, queue_name: Optional[str] = None) -> bool:
+        """Non-blocking legacy admission API."""
+        if not self._can_admit(queue_name):
+            return False
+        self._global_inflight += 1
+        if queue_name is not None:
+            self._queue_inflight[queue_name] = (
+                self._queue_inflight.get(queue_name, 0) + 1
+            )
+        return True
+
+    async def acquire(self, queue_name: str) -> None:
+        """Acquire global/per-queue admission, optionally in FIFO order."""
+        limited = (
+            self.max_inflight is not None
+            or self.max_inflight_per_queue is not None
+        )
+        if not limited:
+            return
+        if not self.fair_inflight:
+            while not self.try_acquire(queue_name):
+                await asyncio.sleep(0.05)
+            return
+
+        loop = asyncio.get_running_loop()
+        waiter = loop.create_future()
+        entry = (queue_name, waiter)
+        self._admission_waiters.append(entry)
+        self._grant_admission_waiters()
+        try:
+            await waiter
+        except asyncio.CancelledError:
+            try:
+                self._admission_waiters.remove(entry)
+            except ValueError:
+                # Already granted: return the reservation.
+                if waiter.done() and not waiter.cancelled():
+                    self.release(queue_name)
+            raise
+
+    def _grant_admission_waiters(self) -> None:
+        if not self._admission_waiters:
+            return
+        checked_without_grant = 0
+        while self._admission_waiters:
+            queue_name, waiter = self._admission_waiters[0]
+            if waiter.cancelled():
+                self._admission_waiters.popleft()
+                continue
+            if self._can_admit(queue_name):
+                self._admission_waiters.popleft()
+                self.try_acquire(queue_name)
+                waiter.set_result(True)
+                checked_without_grant = 0
+                continue
+            self._admission_waiters.rotate(-1)
+            checked_without_grant += 1
+            if checked_without_grant >= len(self._admission_waiters):
+                break
+
+    def release(self, queue_name: Optional[str] = None) -> None:
+        if self.max_inflight is None and self.max_inflight_per_queue is None:
             return
         self._global_inflight = max(0, self._global_inflight - 1)
+        if queue_name is not None:
+            current = self._queue_inflight.get(queue_name, 0)
+            if current <= 1:
+                self._queue_inflight.pop(queue_name, None)
+            else:
+                self._queue_inflight[queue_name] = current - 1
+        if self.fair_inflight:
+            self._grant_admission_waiters()
 
     def _owned_queue_names(self) -> List[str]:
         names = list(self.task_registry.keys())
@@ -1884,6 +2127,7 @@ class mTask:
                     "tasks_completed": 0,
                     "tasks_failed": 0,
                     "tasks_requeued": 0,
+                    "tasks_discarded": 0,
                     "total_execution_time": 0.0,
                     "task_count": 0,
                     "last_updated": datetime.now(timezone.utc).isoformat(),
@@ -1895,6 +2139,8 @@ class mTask:
                 self._metrics[queue_name]["tasks_failed"] += 1
             elif metric_type == "requeued":
                 self._metrics[queue_name]["tasks_requeued"] += 1
+            elif metric_type == "discarded":
+                self._metrics[queue_name]["tasks_discarded"] += 1
             elif metric_type == "execution_time":
                 self._metrics[queue_name]["total_execution_time"] += value
                 self._metrics[queue_name]["task_count"] += 1
@@ -1945,8 +2191,20 @@ class mTask:
                 "owned": queue_name in self.workers,
                 "depth": await self.get_queue_depth(queue_name),
                 "processing": await self.get_processing_count(queue_name),
+                "admitted": self._queue_inflight.get(queue_name, 0),
             }
         return stats
+
+    async def get_stats(self) -> Dict[str, Any]:
+        """Combined runtime snapshot for health endpoints."""
+        return {
+            "is_shutting_down": self.is_shutting_down,
+            "inflight": self.get_inflight_count(),
+            "admitted": self._global_inflight,
+            "workers": await self.get_worker_stats(),
+            "metrics": await self.get_metrics(),
+            "shutdown": self.get_shutdown_stats(),
+        }
 
     def _initialize_status_report_task(self):
         @self.interval(seconds=300)
@@ -2277,13 +2535,29 @@ class mTask:
         task['error'] = error
         task['failed_at'] = datetime.now(timezone.utc).isoformat()
         task['status'] = 'failed'
+        task_json = _dumps(task)
         
         try:
             await self.task_queue.ensure_connected()
-            await asyncio.wait_for(
-                self.task_queue.redis.rpush(dlq_name, json.dumps(task)),
-                timeout=self.task_queue.operation_timeout,
-            )
+            if self.dlq_index_fields and task.get("id"):
+                pipe = self.task_queue.redis.pipeline(transaction=True)
+                pipe.rpush(dlq_name, task_json)
+                pipe.hset(
+                    self._dlq_entries_key(queue_name), task["id"], task_json
+                )
+                for field, value in self._dlq_index_values(task):
+                    pipe.sadd(
+                        self._dlq_index_key(queue_name, field, value),
+                        task["id"],
+                    )
+                await asyncio.wait_for(
+                    pipe.execute(), timeout=self.task_queue.operation_timeout
+                )
+            else:
+                await asyncio.wait_for(
+                    self.task_queue.redis.rpush(dlq_name, task_json),
+                    timeout=self.task_queue.operation_timeout,
+                )
             self.logger.error(
                 f"Task {task['id']} moved to DLQ '{dlq_name}' after {self.retry_limit} retries. Error: {error}"
             )
@@ -2297,6 +2571,48 @@ class mTask:
         if not isinstance(task_kwargs, dict):
             return False
         return all(task_kwargs.get(k) == v for k, v in kwargs_match.items())
+
+    @staticmethod
+    def _dlq_entries_key(queue_name: str) -> str:
+        return f"{queue_name}:dlq:entries"
+
+    @staticmethod
+    def _dlq_index_ready_key(queue_name: str) -> str:
+        return f"{queue_name}:dlq:index:ready"
+
+    @staticmethod
+    def _dlq_index_key(queue_name: str, field: str, value: Any) -> str:
+        encoded = _dumps(value)
+        digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        return f"{queue_name}:dlq:index:{field}:{digest}"
+
+    def _dlq_index_values(
+        self, task: Dict[str, Any]
+    ) -> List[Tuple[str, Any]]:
+        kwargs = task.get("kwargs")
+        if not isinstance(kwargs, dict):
+            return []
+        return [
+            (field, kwargs[field])
+            for field in self.dlq_index_fields
+            if field in kwargs
+        ]
+
+    async def _remove_dlq_indexes(
+        self, queue_name: str, task: Dict[str, Any]
+    ) -> None:
+        task_id = task.get("id")
+        if not task_id or not self.dlq_index_fields:
+            return
+        pipe = self.task_queue.redis.pipeline(transaction=True)
+        pipe.hdel(self._dlq_entries_key(queue_name), task_id)
+        for field, value in self._dlq_index_values(task):
+            pipe.srem(
+                self._dlq_index_key(queue_name, field, value), task_id
+            )
+        await asyncio.wait_for(
+            pipe.execute(), timeout=self.task_queue.operation_timeout
+        )
 
     async def _iter_dlq_entries(
         self, queue_name: str
@@ -2323,12 +2639,24 @@ class mTask:
             else:
                 yield task_json, None
 
-    async def _remove_dlq_raw(self, queue_name: str, task_json: str) -> None:
+    async def _remove_dlq_raw(
+        self,
+        queue_name: str,
+        task_json: str,
+        task: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Remove one exact DLQ list element (LREM needs the original string)."""
         dlq_name = f"{queue_name}:dlq"
+        pipe = self.task_queue.redis.pipeline(transaction=True)
+        pipe.lrem(dlq_name, 0, task_json)
+        if task is not None and task.get("id") and self.dlq_index_fields:
+            pipe.hdel(self._dlq_entries_key(queue_name), task["id"])
+            for field, value in self._dlq_index_values(task):
+                pipe.srem(
+                    self._dlq_index_key(queue_name, field, value), task["id"]
+                )
         await asyncio.wait_for(
-            self.task_queue.redis.lrem(dlq_name, 0, task_json),
-            timeout=self.task_queue.operation_timeout,
+            pipe.execute(), timeout=self.task_queue.operation_timeout
         )
 
     async def get_dlq_tasks(self, queue_name: str) -> List[Dict[str, Any]]:
@@ -2363,9 +2691,51 @@ class mTask:
         if not kwargs_match:
             raise ValueError("kwargs_match must be a non-empty dict")
         try:
+            can_use_index = self.dlq_index_fields and all(
+                field in self.dlq_index_fields for field in kwargs_match
+            )
+            index_ready = bool(
+                can_use_index
+                and await asyncio.wait_for(
+                    self.task_queue.redis.exists(
+                        self._dlq_index_ready_key(queue_name)
+                    ),
+                    timeout=self.task_queue.operation_timeout,
+                )
+            )
+            if index_ready:
+                keys = [
+                    self._dlq_index_key(queue_name, field, value)
+                    for field, value in kwargs_match.items()
+                ]
+                ids = await asyncio.wait_for(
+                    self.task_queue.redis.sinter(*keys),
+                    timeout=self.task_queue.operation_timeout,
+                )
+                if not ids:
+                    return []
+                raw_entries = await asyncio.wait_for(
+                    self.task_queue.redis.hmget(
+                        self._dlq_entries_key(queue_name), *ids
+                    ),
+                    timeout=self.task_queue.operation_timeout,
+                )
+                matches = []
+                for raw in raw_entries:
+                    if raw is None:
+                        continue
+                    task = _loads(raw)
+                    if isinstance(task, dict) and self._kwargs_match(
+                        task, kwargs_match
+                    ):
+                        matches.append(task)
+                return matches
+
             matches = []
             async for _raw, task in self._iter_dlq_entries(queue_name):
-                if task is not None and self._kwargs_match(task, kwargs_match):
+                if task is None:
+                    continue
+                if self._kwargs_match(task, kwargs_match):
                     matches.append(task)
             return matches
         except ValueError:
@@ -2410,7 +2780,7 @@ class mTask:
                 elif not self._kwargs_match(task, kwargs_match):
                     continue
 
-                await self._remove_dlq_raw(queue_name, raw)
+                await self._remove_dlq_raw(queue_name, raw, task)
                 tid = task.get("id")
                 if tid:
                     await self.task_queue.clear_delivery_attempts(queue_name, tid)
@@ -2439,8 +2809,6 @@ class mTask:
                 if task.get("id") != task_id:
                     continue
 
-                await self._remove_dlq_raw(queue_name, task_json)
-
                 # Reset task for retry and strip internal/stale fields
                 task["retry_count"] = 0
                 task["status"] = "pending"
@@ -2450,10 +2818,19 @@ class mTask:
                 task.pop("_task_json", None)
                 task.pop("retry_after", None)
 
-                # Re-enqueue
+                # Remove all DLQ representations and enqueue atomically.
+                pipe = self.task_queue.redis.pipeline(transaction=True)
+                pipe.lrem(dlq_name, 0, task_json)
+                if self.dlq_index_fields:
+                    pipe.hdel(self._dlq_entries_key(queue_name), task_id)
+                    for field, value in self._dlq_index_values(task):
+                        pipe.srem(
+                            self._dlq_index_key(queue_name, field, value),
+                            task_id,
+                        )
+                pipe.rpush(queue_name, _dumps(task))
                 await asyncio.wait_for(
-                    self.task_queue.redis.rpush(queue_name, json.dumps(task)),
-                    timeout=self.task_queue.operation_timeout,
+                    pipe.execute(), timeout=self.task_queue.operation_timeout
                 )
                 self.logger.info(
                     f"Task {task_id} moved from DLQ back to queue '{queue_name}'"
@@ -2475,16 +2852,68 @@ class mTask:
                 self.task_queue.redis.llen(dlq_name),
                 timeout=self.task_queue.operation_timeout,
             )
+            keys = [
+                dlq_name,
+                self._dlq_entries_key(queue_name),
+                self._dlq_index_ready_key(queue_name),
+            ]
+            async for key in self.task_queue.redis.scan_iter(
+                match=f"{queue_name}:dlq:index:*"
+            ):
+                keys.append(key)
+            await asyncio.wait_for(
+                self.task_queue.redis.delete(*keys),
+                timeout=self.task_queue.operation_timeout,
+            )
             if count > 0:
-                await asyncio.wait_for(
-                    self.task_queue.redis.delete(dlq_name),
-                    timeout=self.task_queue.operation_timeout,
-                )
                 self.logger.info(f"Cleared {count} tasks from DLQ '{dlq_name}'")
             return count
         except Exception as e:
             self.logger.exception(f"Failed to clear DLQ '{dlq_name}': {e}")
             return 0
+
+    async def rebuild_dlq_index(self, queue_name: str) -> int:
+        """Rebuild opt-in HASH/SET indexes from the backward-compatible LIST."""
+        if not self.dlq_index_fields:
+            return 0
+        await self.task_queue.ensure_connected()
+        keys = [self._dlq_entries_key(queue_name)]
+        async for key in self.task_queue.redis.scan_iter(
+            match=f"{queue_name}:dlq:index:*"
+        ):
+            keys.append(key)
+        if keys:
+            await asyncio.wait_for(
+                self.task_queue.redis.delete(*keys),
+                timeout=self.task_queue.operation_timeout,
+            )
+
+        count = 0
+        pipe = self.task_queue.redis.pipeline(transaction=True)
+        async for raw, task in self._iter_dlq_entries(queue_name):
+            if task is None or not task.get("id"):
+                continue
+            task_id = task["id"]
+            pipe.hset(self._dlq_entries_key(queue_name), task_id, raw)
+            for field, value in self._dlq_index_values(task):
+                pipe.sadd(
+                    self._dlq_index_key(queue_name, field, value), task_id
+                )
+            count += 1
+        if count:
+            pipe.set(self._dlq_index_ready_key(queue_name), "1")
+            await asyncio.wait_for(
+                pipe.execute(), timeout=self.task_queue.operation_timeout
+            )
+        else:
+            await self.task_queue.redis.set(
+                self._dlq_index_ready_key(queue_name), "1"
+            )
+        return count
+
+    async def rebuild_dlq_indexes(self, queue_name: str) -> int:
+        """Backward-friendly plural alias for rebuild_dlq_index()."""
+        return await self.rebuild_dlq_index(queue_name)
 
     def start_worker(self, queue_name: str):
         if queue_name in self.workers:
@@ -2605,51 +3034,106 @@ class mTask:
                 f"({now - ts:.0f}s); returning to queue"
             )
             try:
-                await self.task_queue.redis.lrem(processing_queue, 1, task_json)
-                task["_task_json"] = task_json
-                await self.task_queue.requeue(
-                    task, queue_name=queue_name, apply_backoff=False
+                removed = await self.task_queue.redis.lrem(
+                    processing_queue, 1, task_json
                 )
+                if not removed:
+                    continue
+                task["_task_json"] = task_json
+                try:
+                    await self.task_queue.requeue(
+                        task, queue_name=queue_name, apply_backoff=False
+                    )
+                except Exception:
+                    # Preserve recoverability if the second half fails.
+                    await self.task_queue.redis.rpush(
+                        processing_queue, task_json
+                    )
+                    raise
                 await self.task_queue.clear_heartbeat(queue_name, task_id)
+                await self._record_metric(queue_name, "requeued")
+                callback = info.get("on_task_requeued")
+                if callback is not None:
+                    self._spawn_requeue_callback(
+                        callback, task, "stale_heartbeat"
+                    )
             except Exception as e:
                 self.logger.error(
                     f"Failed to requeue stale-heartbeat task {task_id}: {e}"
                 )
 
+    def _spawn_requeue_callback(
+        self,
+        callback: Callable,
+        task: Dict[str, Any],
+        reason: str,
+    ) -> None:
+        async def invoke() -> None:
+            await callback(task, reason)
+
+        self._spawn_background(
+            invoke(), f"on-task-requeued:{task.get('id')}"
+        )
+
     async def graceful_shutdown(self):
         """Perform graceful shutdown of all workers and disconnect from Redis."""
         if self._is_shutting_down:
-            self.logger.warning("Shutdown already in progress.")
+            await self.wait_shutdown_complete()
             return
         
         self._is_shutting_down = True
+        event = self._shutdown_event()
+        started_monotonic = time.monotonic()
+        self._shutdown_stats = {
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "completed_at": None,
+            "duration": None,
+            "workers": len(self.workers),
+            "inflight_at_start": self.get_inflight_count(),
+        }
         self.logger.info("Starting graceful shutdown...")
 
-        # Stop internal service tasks first so they don't react to the
-        # workers/queues being torn down.
-        for service_task in (self._monitor_task, self._scheduler_task, self._promote_task):
-            if service_task is not None and not service_task.done():
-                service_task.cancel()
-        for service_task in (self._monitor_task, self._scheduler_task, self._promote_task):
-            if service_task is not None:
-                try:
-                    await asyncio.gather(service_task, return_exceptions=True)
-                except asyncio.CancelledError:
-                    pass
+        try:
+            # Stop internal services before workers/queues are torn down.
+            service_tasks = (
+                self._monitor_task,
+                self._scheduler_task,
+                self._promote_task,
+            )
+            for service_task in service_tasks:
+                if service_task is not None and not service_task.done():
+                    service_task.cancel()
+            for service_task in service_tasks:
+                if service_task is not None:
+                    await asyncio.gather(
+                        service_task, return_exceptions=True
+                    )
 
-        # Stop all workers with timeout (iterate over a copy: pause_queue /
-        # monitor_queue_status may mutate self.workers concurrently)
-        shutdown_tasks = []
-        for queue_name, worker in list(self.workers.items()):
-            self.logger.info(f"Stopping worker for queue '{queue_name}'...")
-            shutdown_tasks.append(worker.stop(graceful=True, timeout=self.shutdown_timeout))
-        
-        if shutdown_tasks:
-            await asyncio.gather(*shutdown_tasks, return_exceptions=True)
-        
-        # Disconnect from Redis
-        await self.task_queue.disconnect()
-        self.logger.info("Graceful shutdown completed.")
+            shutdown_tasks = []
+            for queue_name, worker in list(self.workers.items()):
+                self.logger.info(f"Stopping worker for queue '{queue_name}'...")
+                shutdown_tasks.append(
+                    worker.stop(
+                        graceful=True, timeout=self.shutdown_timeout
+                    )
+                )
+            if shutdown_tasks:
+                await asyncio.gather(*shutdown_tasks, return_exceptions=True)
+
+            await self.task_queue.disconnect()
+            self.logger.info("Graceful shutdown completed.")
+        finally:
+            self._shutdown_stats["completed_at"] = datetime.now(
+                timezone.utc
+            ).isoformat()
+            self._shutdown_stats["duration"] = (
+                time.monotonic() - started_monotonic
+            )
+            event.set()
+
+    async def shutdown(self) -> None:
+        """Public, idempotent shutdown entry point."""
+        await self.graceful_shutdown()
 
     async def run(self, *, workers: bool = True, scheduler: bool = True):
         try:

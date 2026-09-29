@@ -1,6 +1,36 @@
 
 `μTask` is a simple task queue and scheduler library using Redis and asyncio
 
+## 0.5 opt-in APIs
+
+```python
+from mtask import TaskOutcome, mTask
+
+queues = mTask(
+    max_inflight=30,
+    fair_inflight=True,
+    max_inflight_per_queue=10,
+    dlq_index_fields=["report_id"],
+)
+
+@queues.agent("reports")
+async def process_report(**kwargs):
+    if kwargs.get("retry_later"):
+        return TaskOutcome.RETRY
+    if kwargs.get("obsolete"):
+        return TaskOutcome.DISCARD
+    return TaskOutcome.SUCCESS
+
+# Application lifecycle hook:
+await queues.shutdown()
+await queues.wait_shutdown_complete()
+```
+
+All legacy handler return values remain successful. Fair admission, per-queue
+admission caps, and DLQ indexes are disabled by default. Use
+`rebuild_dlq_index(queue_name)` after enabling indexes to backfill existing
+LIST entries. See `MIGRATION.md` for Redis keys and rollout guidance.
+
 ```
 async def requeue_callback(task: Dict[str, Any], reason: str):
     # {"id": "95729f66-c4d7-404b-a7da-3ebe5ff0ed5b", "name": "topic_second_checker", "kwargs": {"domain": "google.com", "report_id": "6755f85e8bb404bcbf536a2ae", "report_type": "auctions", "source": "godaddy", "item_id": "599444209", "end_time": 1734456120, "price": 25.0, "bids": 0}, "status": "pending", "retry_count": 0}

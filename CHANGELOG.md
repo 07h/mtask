@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.5.0
+
+### Added
+
+- `TaskOutcome.SUCCESS`, `TaskOutcome.RETRY`, and `TaskOutcome.DISCARD`.
+  Existing handler return values, including strings and booleans, still mean
+  success.
+- Unified `on_task_requeued(task, reason)` notifications for timeout
+  (`timeout`), ordinary exceptions (`exception`), explicit outcomes
+  (`task_outcome_retry`), and stale heartbeats (`stale_heartbeat`).
+- Opt-in fair process-wide admission with `fair_inflight=True`, plus
+  `max_inflight_per_queue` (an integer or queue-to-limit mapping).
+- Opt-in DLQ indexes with `dlq_index_fields=[...]`. The canonical LIST is
+  dual-written with a HASH and value SETs; LIST-only entries remain readable.
+  `rebuild_dlq_index(queue_name)` rebuilds indexes online.
+- Public shutdown lifecycle: `shutdown()`, `is_shutting_down`,
+  `wait_shutdown_complete()`, `shutdown_stats`, and `get_shutdown_stats()`.
+- Aggregate `get_stats()` runtime snapshot for health endpoints.
+- Worker stats now include each queue's admitted task count.
+
+### Compatibility
+
+- All new scheduling, indexing, and outcome behavior is opt-in or additive.
+- Defaults retain 0.4 scheduling and LIST-only DLQ storage.
+- Python 3.8 remains supported.
+
 ## 0.4.1
 
 ### Fixed
