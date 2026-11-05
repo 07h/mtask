@@ -168,3 +168,4 @@ __t*.py
 _t*.py
 
 .vscode
+.venv311/

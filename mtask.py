@@ -62,6 +62,12 @@ except ImportError:  # pragma: no cover - depends on environment
         return json.loads(s)
 
 
+# Bounded Redis LIST scans (heartbeat reap + DLQ listing). Full LRANGE 0,-1
+# every promote tick (~0.5s) or on every DLQ helper call is unbounded and
+# grows with queue depth; paginate instead. Same visible behavior.
+_REDIS_LIST_SCAN_BATCH = 256
+
+
 # ============================
 # Lua Scripts
 # ============================
@@ -1747,14 +1753,19 @@ class ScheduledTask:
         interval: Optional[int] = None,
         cron_expression: Optional[str] = None,
         logger: Optional[logging.Logger] = None,
+        max_runtime: Optional[float] = None,
     ):
+        if max_runtime is not None and max_runtime <= 0:
+            raise ValueError("max_runtime must be > 0 or None")
         self.func = func
         self.interval = interval
         self.cron_expression = cron_expression
+        self.max_runtime = max_runtime
         self.last_run = None
         self.next_run = self._get_next_run()
         self.is_running = False
         self.logger = logger or logging.getLogger("ScheduledTask")
+        self._detached_tasks: set = set()
 
     def _get_next_run(self) -> datetime:
         now = datetime.now()
@@ -1775,12 +1786,46 @@ class ScheduledTask:
         # (interval drift). Overlap is still prevented by is_running.
         self.last_run = datetime.now()
         self.next_run = self._get_next_run()
+        started = time.monotonic()
         try:
-            await self.func()
+            if self.max_runtime is None:
+                await self.func()
+            else:
+                await self._run_with_max_runtime(started)
         except Exception as e:
             self.logger.exception(f"Error in scheduled task {self.func.__name__}: {e}")
         finally:
+            # Always clear so the next tick can fire even after a timeout.
             self.is_running = False
+
+    async def _run_with_max_runtime(self, started: float) -> None:
+        """Cancel a scheduled invocation that exceeds max_runtime.
+
+        Uses a short grace period (like Worker._run_with_timeout) so an
+        uncooperative coroutine cannot pin is_running forever. The still-
+        running task is detached; is_running is cleared by run()'s finally.
+        """
+        coro_task = asyncio.ensure_future(self.func())
+        done, _ = await asyncio.wait({coro_task}, timeout=self.max_runtime)
+        if coro_task in done:
+            # Propagate result/exception from the completed invocation.
+            coro_task.result()
+            return
+
+        coro_task.cancel()
+        await asyncio.wait({coro_task}, timeout=1.0)
+        duration = time.monotonic() - started
+        self.logger.warning(
+            "Scheduled task '%s' exceeded max_runtime=%.3fs "
+            "(ran %.3fs); cancelled so the next tick can run",
+            self.func.__name__,
+            self.max_runtime,
+            duration,
+        )
+        if not coro_task.done():
+            # Detach: keep a strong ref so the task is not GC'd mid-flight.
+            self._detached_tasks.add(coro_task)
+            coro_task.add_done_callback(self._detached_tasks.discard)
 
     def should_run(self) -> bool:
         return datetime.now() >= self.next_run and not self.is_running
@@ -2451,16 +2496,29 @@ class mTask:
     def interval(
         self,
         seconds: int = 60,
+        max_runtime: Optional[float] = None,
     ):
         # Validate parameters
         if seconds <= 0:
             raise ValueError("seconds must be > 0")
-        
+        if max_runtime is not None and max_runtime <= 0:
+            raise ValueError("max_runtime must be > 0 or None")
+
         def decorator(func: Callable):
-            scheduled_task = ScheduledTask(func, interval=seconds, logger=self.logger)
+            scheduled_task = ScheduledTask(
+                func,
+                interval=seconds,
+                logger=self.logger,
+                max_runtime=max_runtime,
+            )
             self.scheduled_tasks.append(scheduled_task)
             self.logger.debug(
-                f"Scheduled interval task '{func.__name__}' every {seconds} seconds."
+                f"Scheduled interval task '{func.__name__}' every {seconds} seconds"
+                + (
+                    f" (max_runtime={max_runtime}s)."
+                    if max_runtime is not None
+                    else "."
+                )
             )
             return func
 
@@ -2469,23 +2527,35 @@ class mTask:
     def cron(
         self,
         cron_expression: str,
+        max_runtime: Optional[float] = None,
     ):
         # Validate cron expression
         if not cron_expression or not isinstance(cron_expression, str):
             raise ValueError("cron_expression must be a non-empty string")
+        if max_runtime is not None and max_runtime <= 0:
+            raise ValueError("max_runtime must be > 0 or None")
         try:
             # Test if cron expression is valid
             croniter(cron_expression, datetime.now())
         except Exception as e:
             raise ValueError(f"Invalid cron expression: {e}")
-        
+
         def decorator(func: Callable):
             scheduled_task = ScheduledTask(
-                func, cron_expression=cron_expression, logger=self.logger
+                func,
+                cron_expression=cron_expression,
+                logger=self.logger,
+                max_runtime=max_runtime,
             )
             self.scheduled_tasks.append(scheduled_task)
             self.logger.debug(
-                f"Scheduled cron task '{func.__name__}' with cron expression '{cron_expression}'."
+                f"Scheduled cron task '{func.__name__}' with cron expression "
+                f"'{cron_expression}'"
+                + (
+                    f" (max_runtime={max_runtime}s)."
+                    if max_runtime is not None
+                    else "."
+                )
             )
             return func
 
@@ -2621,23 +2691,36 @@ class mTask:
 
         parsed_task is None for poison / non-dict entries (same semantics as
         get_dlq_tasks for unparseable JSON).
+
+        Reads the LIST in bounded LRANGE pages instead of a single
+        unbounded ``LRANGE 0 -1``.
         """
         dlq_name = f"{queue_name}:dlq"
         await self.task_queue.ensure_connected()
-        tasks_json = await asyncio.wait_for(
-            self.task_queue.redis.lrange(dlq_name, 0, -1),
-            timeout=self.task_queue.operation_timeout,
-        )
-        for task_json in tasks_json:
-            try:
-                task = json.loads(task_json)
-            except (json.JSONDecodeError, ValueError):
-                yield task_json, None
-                continue
-            if isinstance(task, dict):
-                yield task_json, task
-            else:
-                yield task_json, None
+        start = 0
+        batch = _REDIS_LIST_SCAN_BATCH
+        while True:
+            tasks_json = await asyncio.wait_for(
+                self.task_queue.redis.lrange(
+                    dlq_name, start, start + batch - 1
+                ),
+                timeout=self.task_queue.operation_timeout,
+            )
+            if not tasks_json:
+                break
+            for task_json in tasks_json:
+                try:
+                    task = json.loads(task_json)
+                except (json.JSONDecodeError, ValueError):
+                    yield task_json, None
+                    continue
+                if isinstance(task, dict):
+                    yield task_json, task
+                else:
+                    yield task_json, None
+            if len(tasks_json) < batch:
+                break
+            start += batch
 
     async def _remove_dlq_raw(
         self,
@@ -3022,27 +3105,51 @@ class mTask:
         if not heartbeats:
             return
         now = time.time()
-        processing_queue = f"{queue_name}:processing"
-        try:
-            entries = await asyncio.wait_for(
-                self.task_queue.redis.lrange(processing_queue, 0, -1),
-                timeout=self.task_queue.operation_timeout,
-            )
-        except Exception:
+        stale_ids = {
+            task_id
+            for task_id, ts in heartbeats.items()
+            if now - ts > stale_after
+        }
+        if not stale_ids:
             return
-        for task_json in entries or []:
+
+        processing_queue = f"{queue_name}:processing"
+        # Collect matching processing entries via bounded LRANGE pages
+        # (same semantics as a single snapshot scan, without unbounded reads
+        # on every promote tick).
+        to_reap: List[Tuple[str, Dict[str, Any], str]] = []
+        start = 0
+        batch = _REDIS_LIST_SCAN_BATCH
+        while stale_ids:
             try:
-                task = _loads(task_json)
-            except (json.JSONDecodeError, ValueError, TypeError):
-                continue
-            if not isinstance(task, dict):
-                continue
-            task_id = task.get("id")
-            ts = heartbeats.get(task_id)
-            if ts is None:
-                continue
-            if now - ts <= stale_after:
-                continue
+                entries = await asyncio.wait_for(
+                    self.task_queue.redis.lrange(
+                        processing_queue, start, start + batch - 1
+                    ),
+                    timeout=self.task_queue.operation_timeout,
+                )
+            except Exception:
+                return
+            if not entries:
+                break
+            for task_json in entries:
+                try:
+                    task = _loads(task_json)
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    continue
+                if not isinstance(task, dict):
+                    continue
+                task_id = task.get("id")
+                if task_id not in stale_ids:
+                    continue
+                to_reap.append((task_json, task, task_id))
+                stale_ids.discard(task_id)
+            if len(entries) < batch:
+                break
+            start += batch
+
+        for task_json, task, task_id in to_reap:
+            ts = heartbeats.get(task_id, now)
             self.logger.warning(
                 f"Stale heartbeat for task {task_id} on '{queue_name}' "
                 f"({now - ts:.0f}s); returning to queue"

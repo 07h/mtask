@@ -1,3 +1,10 @@
+# Migrating to 0.5.1
+
+Additive only. Optional `max_runtime=` on `@interval` / `@cron` /
+`ScheduledTask` caps a single invocation; omit it for the previous
+no-timeout behavior. Heartbeat reap and DLQ listing still return the same
+data; they paginate Redis `LRANGE` internally.
+
 # Migrating from mtask 0.4.x to 0.5.0
 
 0.5.0 is backward-compatible. Existing constructors, decorators, handler
