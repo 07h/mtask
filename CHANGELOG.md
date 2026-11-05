@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.5.1
+
+### Added
+
+- Optional `max_runtime=` on `ScheduledTask`, `@interval`, and `@cron`. When
+  set, an invocation that exceeds the budget is cancelled, `is_running` is
+  cleared, and a warning is logged (task name + duration) so the next tick can
+  run. Default remains no timeout (backward compatible).
+
+### Changed
+
+- Heartbeat stale-reap and DLQ list iteration use bounded `LRANGE` pages
+  (`_REDIS_LIST_SCAN_BATCH`) instead of unbounded `LRANGE 0,-1` on every
+  promote tick / DLQ helper call. Observable behavior is unchanged.
+
 ## 0.5.0
 
 ### Added
